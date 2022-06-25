@@ -13,6 +13,7 @@ var (
 type Pool interface {
 	Get() (PoolItem, error)
 	GetWithContext(context.Context) (PoolItem, error)
+	Release(PoolItem)
 	Put(PoolItem)
 	Len() int
 	Close()
@@ -96,6 +97,17 @@ func (p *pool) Put(item PoolItem) {
 		}
 	}
 	p.queue <- item
+}
+
+func (p *pool) Release(item PoolItem) {
+	if item != nil {
+		item.Close()
+		{
+			p.Lock()
+			p.count--
+			p.Unlock()
+		}
+	}
 }
 
 func (p *pool) Close() {
