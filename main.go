@@ -3,21 +3,34 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
+	"os"
 	"runtime"
 	"time"
 
+	log "github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/andrei-cloud/anet/broker"
 	"github.com/andrei-cloud/anet/pool"
-	"golang.org/x/sync/errgroup"
 )
 
 const workers = 2
 
+type loggerWrapper struct {
+	l log.Logger
+}
+
+func (l *loggerWrapper) Log(keyvals ...interface{}) error {
+	l.l.Print(keyvals...)
+	return nil
+}
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	fmt.Println("pooler")
+	logger := loggerWrapper{
+		l: log.New(os.Stdout).With().Timestamp().Logger(),
+	}
 
 	factory := func(addr string) pool.Factory {
 		return func() (pool.PoolItem, error) {
@@ -25,11 +38,11 @@ func main() {
 		}
 	}
 
-	log.Println("initializing pool")
+	logger.Log("info", "initializing pool")
 	p := pool.NewPool(workers, factory(":3456"))
 
-	log.Println("initializing broker")
-	broker := broker.NewBroker(p, workers)
+	logger.Log("info", "initializing broker")
+	broker := broker.NewBroker(p, workers, &logger)
 	defer broker.Close()
 
 	brokerCtx, stopBroker := context.WithCancel(context.Background())
@@ -45,20 +58,19 @@ func main() {
 		wg.Go(func() error {
 			return func(i int) error {
 				request := []byte(fmt.Sprintf("hello_%d", i))
-				log.Println("sending request to broker")
+				logger.Log("info", "sending request to broker")
 				start := time.Now()
 				resp, err := broker.Send(request)
 				if err != nil {
 					return err
 				}
 
-				log.Printf("response in %v\n", time.Since(start))
-				log.Println(string(resp))
+				logger.Log("latency", time.Since(start), "response", string(resp))
 				return nil
 			}(i)
 		})
 	}
 
 	wg.Wait()
-	log.Printf("finished in %v\n", time.Since(start))
+	logger.Log("finishedin", time.Since(start))
 }
