@@ -8,11 +8,9 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/andrei-cloud/anet"
 	log "github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
-
-	"github.com/andrei-cloud/anet/broker"
-	"github.com/andrei-cloud/anet/pool"
 )
 
 const workers = 2
@@ -32,17 +30,17 @@ func main() {
 		l: log.New(os.Stdout).With().Timestamp().Logger(),
 	}
 
-	factory := func(addr string) pool.Factory {
-		return func() (pool.PoolItem, error) {
+	factory := func(addr string) anet.Factory {
+		return func() (anet.PoolItem, error) {
 			return net.Dial("tcp", addr)
 		}
 	}
 
 	logger.Log("info", "initializing pool")
-	p := pool.NewPool(workers, factory(":3456"))
+	p := anet.NewPool(workers, factory(":3456"))
 
 	logger.Log("info", "initializing broker")
-	broker := broker.NewBroker(p, workers, &logger)
+	broker := anet.NewBroker(p, workers, &logger)
 	defer broker.Close()
 
 	brokerCtx, stopBroker := context.WithCancel(context.Background())

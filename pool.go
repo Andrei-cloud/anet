@@ -1,4 +1,4 @@
-package pool
+package anet
 
 import (
 	"context"
@@ -95,6 +95,7 @@ func (p *pool) Put(item PoolItem) {
 			p.count--
 			p.Unlock()
 		}
+		return
 	}
 	p.queue <- item
 }

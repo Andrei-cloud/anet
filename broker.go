@@ -1,4 +1,4 @@
-package broker
+package anet
 
 import (
 	"bufio"
@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/andrei-cloud/anet/pool"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -36,7 +35,7 @@ type PendingList map[string]*Task
 type broker struct {
 	sync.Mutex
 	workers      int
-	connPool     pool.Pool
+	connPool     Pool
 	requestQueue chan *Task
 	pending      PendingList
 	quit         chan struct{}
@@ -46,7 +45,7 @@ type broker struct {
 	timeout time.Duration
 }
 
-func NewBroker(cp pool.Pool, n int, l Logger) *broker {
+func NewBroker(cp Pool, n int, l Logger) *broker {
 	return &broker{
 		workers:      n,
 		connPool:     cp,
