@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"runtime"
 	"time"
 
 	"github.com/andrei-cloud/anet"
@@ -25,10 +24,12 @@ func (l *loggerWrapper) Log(keyvals ...interface{}) error {
 }
 
 func main() {
-	runtime.GOMAXPROCS(runtime.NumCPU())
 	logger := loggerWrapper{
 		l: log.New(os.Stdout).With().Timestamp().Logger(),
 	}
+
+	addr, stop := anet.SpinTestServer()
+	defer stop()
 
 	factory := func(addr string) anet.Factory {
 		return func() (anet.PoolItem, error) {
@@ -36,10 +37,10 @@ func main() {
 		}
 	}
 
-	logger.Log("info", "initializing pool")
-	p := anet.NewPool(workers, factory(":3456"))
+	logger.Log("initializing pool")
+	p := anet.NewPool(workers, factory(addr))
 
-	logger.Log("info", "initializing broker")
+	logger.Log("initializing broker")
 	broker := anet.NewBroker(p, workers, &logger)
 	defer broker.Close()
 
@@ -51,24 +52,24 @@ func main() {
 	wg := errgroup.Group{}
 	wg.SetLimit(workers)
 	start := time.Now()
-	for i := 0; i < 10000; i++ {
+	for i := 0; i < 50000; i++ {
 		i := i
 		wg.Go(func() error {
 			return func(i int) error {
 				request := []byte(fmt.Sprintf("hello_%d", i))
-				logger.Log("info", "sending request to broker")
+				logger.Log("sending request to broker")
 				start := time.Now()
 				resp, err := broker.Send(request)
 				if err != nil {
 					return err
 				}
 
-				logger.Log("latency", time.Since(start), "response", string(resp))
+				logger.Log("latency: ", time.Since(start), " response: ", string(resp))
 				return nil
 			}(i)
 		})
 	}
 
 	wg.Wait()
-	logger.Log("finishedin", time.Since(start))
+	logger.Log("finished in:", time.Since(start))
 }

@@ -2,6 +2,7 @@ package anet
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -16,7 +17,7 @@ func TestPool(t *testing.T) {
 		}
 	}
 
-	addr, stop := spinTestServer()
+	addr, stop := SpinTestServer()
 	defer stop()
 
 	t.Run("NewPool", func(t *testing.T) {
@@ -82,4 +83,67 @@ func TestPool(t *testing.T) {
 		require.Equal(t, 0, p.Len())
 	})
 
+}
+
+func BenchmarkBrokerSend(b *testing.B) {
+	worker_num := []int{1, 50, 100, 1000}
+	factory := func(addr string) Factory {
+		return func() (PoolItem, error) {
+			return net.Dial("tcp", addr)
+		}
+	}
+
+	addr, stop := SpinTestServer()
+	defer stop()
+
+	p := NewPool(2, factory(addr))
+	require.NotNil(b, p)
+	defer p.Close()
+
+	for _, i := range worker_num {
+		b.Run(fmt.Sprintf("Workers %d", i), func(b *testing.B) {
+			broker := NewBroker(p, i, nil)
+			require.NotNil(b, p)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go broker.Start(ctx)
+
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				_, err := broker.Send([]byte("test"))
+				require.NoError(b, err)
+			}
+		})
+	}
+}
+
+func BenchmarkPool(b *testing.B) {
+	worker_num := []int{1, 50, 100, 1000, 5000}
+	factory := func(addr string) Factory {
+		return func() (PoolItem, error) {
+			return net.Dial("tcp", addr)
+		}
+	}
+
+	addr, stop := SpinTestServer()
+	defer stop()
+
+	for _, i := range worker_num {
+		p := NewPool(1, factory(addr))
+		require.NotNil(b, p)
+		b.Run(fmt.Sprintf("Workers %d", i), func(b *testing.B) {
+			benchmarkPool(p, b)
+		})
+		p.Close()
+	}
+}
+
+func benchmarkPool(p *pool, b *testing.B) {
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		item, _ := p.Get()
+		p.Put(item)
+	}
 }

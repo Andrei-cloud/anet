@@ -58,6 +58,12 @@ func NewBroker(cp Pool, n int, l Logger) *broker {
 	}
 }
 
+func (b *broker) Log(keyvals ...interface{}) {
+	if b.logger != nil {
+		b.logger.Log(keyvals...)
+	}
+}
+
 func (b *broker) Start(ctx context.Context) {
 	eg := &errgroup.Group{}
 
@@ -67,7 +73,7 @@ func (b *broker) Start(ctx context.Context) {
 		})
 	}
 	if err := eg.Wait(); err != nil {
-		b.logger.Log("error", err)
+		b.Log("error", err)
 	}
 }
 
@@ -125,13 +131,13 @@ func (b *broker) worker(ctx context.Context) error {
 		case task := <-b.requestQueue:
 			out, err := Encode(b.addTask(task))
 			if err != nil {
-				b.logger.Log("err", err)
+				b.Log("err", err)
 				task.errCh <- err
 				continue
 			}
 			conn, err := b.connPool.GetWithContext(ctx)
 			if err != nil {
-				b.logger.Log("err", err)
+				b.Log("err", err)
 				task.errCh <- err
 				b.connPool.Release(conn)
 				continue
@@ -140,23 +146,23 @@ func (b *broker) worker(ctx context.Context) error {
 
 			n, err := c.Write(out)
 			if err != nil {
-				b.logger.Log("err", err)
+				b.Log("err", err)
 				task.errCh <- err
 				b.connPool.Release(conn)
 				continue
 			}
-			b.logger.Log("info", fmt.Sprintf("write %d bytes to %s", n, c.RemoteAddr()))
-			b.logger.Log("info", fmt.Sprintf("%s -> %s", c.RemoteAddr(), out))
+			b.Log(fmt.Sprintf("write %d bytes to %s", n, c.RemoteAddr()))
+			b.Log(fmt.Sprintf("%s -> %s", c.RemoteAddr(), out))
 
 			resp, err := Decode(bufio.NewReader(c))
 			if err != nil {
-				b.logger.Log("err", err)
+				b.Log("err", err)
 				task.errCh <- err
 				b.connPool.Release(conn)
 				continue
 			}
-			b.logger.Log("info", fmt.Sprintf("read from %s", c.RemoteAddr()))
-			b.logger.Log("info", fmt.Sprintf("%s <- %s", c.RemoteAddr(), resp))
+			b.Log(fmt.Sprintf("read from %s", c.RemoteAddr()))
+			b.Log(fmt.Sprintf("%s <- %s", c.RemoteAddr(), resp))
 			b.respondPending(resp)
 			b.connPool.Put(conn)
 		}
@@ -174,7 +180,7 @@ func (b *broker) respondPending(msg []byte) {
 	b.Lock()
 	defer b.Unlock()
 	if task, ok = b.pending[header]; !ok {
-		b.logger.Log("info", fmt.Sprintf("pending task for %s not found; response descarded", header))
+		b.Log(fmt.Sprintf("pending task for %s not found; response descarded", header))
 		return
 	}
 	defer close(task.response)
