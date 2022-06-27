@@ -38,7 +38,7 @@ func main() {
 	}
 
 	logger.Log("initializing pool")
-	p := anet.NewPool(workers, factory(addr))
+	p := anet.NewPool(workers*2, factory(addr))
 
 	logger.Log("initializing broker")
 	broker := anet.NewBroker(p, workers, &logger)
@@ -52,14 +52,14 @@ func main() {
 	wg := errgroup.Group{}
 	wg.SetLimit(workers)
 	start := time.Now()
-	for i := 0; i < 50000; i++ {
+	for i := 0; i < 2; i++ {
 		i := i
 		wg.Go(func() error {
 			return func(i int) error {
 				request := []byte(fmt.Sprintf("hello_%d", i))
 				logger.Log("sending request to broker")
 				start := time.Now()
-				resp, err := broker.Send(request)
+				resp, err := broker.Send(&request)
 				if err != nil {
 					return err
 				}

@@ -25,7 +25,7 @@ type Logger interface {
 
 type Task struct {
 	taskID   string
-	request  []byte
+	request  *[]byte
 	response chan []byte
 	errCh    chan error
 }
@@ -86,7 +86,7 @@ func (b *broker) Close() {
 	close(b.requestQueue)
 }
 
-func (b *broker) Send(req []byte) ([]byte, error) {
+func (b *broker) Send(req *[]byte) ([]byte, error) {
 	var (
 		resp []byte
 		err  error
@@ -97,17 +97,16 @@ func (b *broker) Send(req []byte) ([]byte, error) {
 
 	select {
 	case resp = <-task.response:
+		return resp, nil
 	case err = <-task.errCh:
 		b.failPending(task)
 		return nil, err
 	case <-time.After(b.timeout):
 		return nil, ErrTimeout
 	}
-
-	return resp, nil
 }
 
-func (b *broker) newTask(r []byte) *Task {
+func (b *broker) newTask(r *[]byte) *Task {
 	return &Task{
 		taskID:   randString(taskIDSize),
 		request:  r,
@@ -117,19 +116,25 @@ func (b *broker) newTask(r []byte) *Task {
 }
 
 func (b *broker) addTask(task *Task) []byte {
-	b.Lock()
-	b.pending[task.taskID] = task
-	b.Unlock()
-	return append([]byte(task.taskID), task.request...)
+	{
+		b.Lock()
+		b.pending[task.taskID] = task
+		b.Unlock()
+	}
+	return append([]byte(task.taskID), *task.request...)
 }
 
-func (b *broker) worker(ctx context.Context) error {
+func (b *broker) worker(ctx context.Context) (err error) {
+	var (
+		msg []byte
+		c   net.Conn
+	)
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case task := <-b.requestQueue:
-			out, err := Encode(b.addTask(task))
+			msg, err = Encode(b.addTask(task))
 			if err != nil {
 				b.Log("err", err)
 				task.errCh <- err
@@ -142,28 +147,26 @@ func (b *broker) worker(ctx context.Context) error {
 				b.connPool.Release(conn)
 				continue
 			}
-			c := conn.(net.Conn)
+			c = conn.(net.Conn)
 
-			n, err := c.Write(out)
+			_, err = c.Write(msg)
 			if err != nil {
 				b.Log("err", err)
 				task.errCh <- err
 				b.connPool.Release(conn)
 				continue
 			}
-			b.Log(fmt.Sprintf("write %d bytes to %s", n, c.RemoteAddr()))
-			b.Log(fmt.Sprintf("%s -> %s", c.RemoteAddr(), out))
+			b.Log(c.RemoteAddr(), " -> ", string(msg))
 
-			resp, err := Decode(bufio.NewReader(c))
+			msg, err = Decode(bufio.NewReader(c))
 			if err != nil {
 				b.Log("err", err)
 				task.errCh <- err
 				b.connPool.Release(conn)
 				continue
 			}
-			b.Log(fmt.Sprintf("read from %s", c.RemoteAddr()))
-			b.Log(fmt.Sprintf("%s <- %s", c.RemoteAddr(), resp))
-			b.respondPending(resp)
+			b.Log(c.RemoteAddr(), " <- ", string(msg))
+			b.respondPending(msg)
 			b.connPool.Put(conn)
 		}
 
@@ -178,19 +181,28 @@ func (b *broker) respondPending(msg []byte) {
 	header := string((msg)[:taskIDSize])
 	response := (msg)[taskIDSize:]
 	b.Lock()
-	defer b.Unlock()
 	if task, ok = b.pending[header]; !ok {
 		b.Log(fmt.Sprintf("pending task for %s not found; response descarded", header))
+		b.Unlock()
 		return
 	}
-	defer close(task.response)
+	b.Unlock()
 	task.response <- response
-	delete(b.pending, header)
+	{
+		b.Lock()
+		delete(b.pending, header)
+		b.Unlock()
+	}
+	close(task.response)
+	close(task.errCh)
 }
 
 func (b *broker) failPending(task *Task) {
-	b.Lock()
-	defer b.Unlock()
-	defer close(task.response)
-	delete(b.pending, task.taskID)
+	{
+		b.Lock()
+		delete(b.pending, task.taskID)
+		b.Unlock()
+	}
+	close(task.response)
+	close(task.errCh)
 }

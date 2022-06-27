@@ -86,7 +86,7 @@ func TestPool(t *testing.T) {
 }
 
 func BenchmarkBrokerSend(b *testing.B) {
-	worker_num := []int{1, 50, 100, 1000}
+	worker_num := []int{1}
 	factory := func(addr string) Factory {
 		return func() (PoolItem, error) {
 			return net.Dial("tcp", addr)
@@ -96,7 +96,7 @@ func BenchmarkBrokerSend(b *testing.B) {
 	addr, stop := SpinTestServer()
 	defer stop()
 
-	p := NewPool(2, factory(addr))
+	p := NewPool(3, factory(addr))
 	require.NotNil(b, p)
 	defer p.Close()
 
@@ -109,11 +109,11 @@ func BenchmarkBrokerSend(b *testing.B) {
 			defer cancel()
 			go broker.Start(ctx)
 
+			msg := []byte("test")
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				_, err := broker.Send([]byte("test"))
-				require.NoError(b, err)
+				broker.Send(&msg)
 			}
 		})
 	}
