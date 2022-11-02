@@ -16,7 +16,8 @@ type Pool interface {
 	GetWithContext(context.Context) (PoolItem, error)
 	Release(PoolItem)
 	Put(PoolItem)
-	Len() uint32
+	Len() int
+	Cap() int
 	Close()
 }
 
@@ -27,7 +28,7 @@ type PoolItem interface {
 type Factory func() (PoolItem, error)
 
 type pool struct {
-	sync.Mutex
+	sync.RWMutex
 	cap, count  uint32
 	queue       chan PoolItem
 	factoryFunc Factory
@@ -51,8 +52,9 @@ func (p *pool) Get() (item PoolItem, err error) {
 		if item, err = p.factoryFunc(); err != nil {
 			return nil, err
 		}
+
+		p.queue <- item
 		atomic.AddUint32(&p.count, 1)
-		return item, nil
 	}
 	return <-p.queue, nil
 }
@@ -66,8 +68,8 @@ func (p *pool) GetWithContext(ctx context.Context) (item PoolItem, err error) {
 			return nil, err
 		}
 
+		p.queue <- item
 		atomic.AddUint32(&p.count, 1)
-		return item, nil
 	}
 	select {
 	case <-ctx.Done():
@@ -79,8 +81,7 @@ func (p *pool) GetWithContext(ctx context.Context) (item PoolItem, err error) {
 
 func (p *pool) Put(item PoolItem) {
 	if p.closing {
-		item.Close()
-		atomic.AddUint32(&p.count, ^uint32(0))
+		p.Release(item)
 		return
 	}
 	p.queue <- item
@@ -94,14 +95,14 @@ func (p *pool) Release(item PoolItem) {
 }
 
 func (p *pool) Close() {
-	p.Lock()
-	defer p.Unlock()
+	p.RLock()
 	p.closing = true
+	p.RUnlock()
 	for len(p.queue) > 0 {
 		item := <-p.queue
-		item.Close()
-		atomic.AddUint32(&p.count, ^uint32(0))
+		p.Release(item)
 	}
 }
 
-func (p *pool) Len() uint32 { return p.count }
+func (p *pool) Len() int { return int(p.count) }
+func (p *pool) Cap() int { return int(p.cap) }
