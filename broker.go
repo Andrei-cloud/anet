@@ -49,18 +49,15 @@ func NewBroker(p Pool, n int, l Logger) *broker {
 	}
 }
 
-func (b *broker) Start(ctx context.Context) error {
+func (b *broker) Start() error {
 	eg := &errgroup.Group{}
 
 	for i := 0; i < b.sendWorkers; i++ {
 		eg.Go(func() error {
-			return b.writeloop(ctx)
+			return b.writeloop()
 		})
-	}
-
-	for i := 0; i < b.recvWorkers; i++ {
 		eg.Go(func() error {
-			return b.readloop(ctx)
+			return b.readloop()
 		})
 	}
 
@@ -122,7 +119,7 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 	return resp, nil
 }
 
-func (b *broker) writeloop(ctx context.Context) error {
+func (b *broker) writeloop() error {
 	var (
 		cmd  []byte
 		task *Task
@@ -131,8 +128,6 @@ func (b *broker) writeloop(ctx context.Context) error {
 		select {
 		case <-b.quit:
 			return ErrQuit
-		case <-ctx.Done():
-			return ctx.Err()
 		case task = <-b.requestQueue:
 			w, err := b.compool.Get()
 			if err != nil {
@@ -162,7 +157,7 @@ func (b *broker) writeloop(ctx context.Context) error {
 	}
 }
 
-func (b *broker) readloop(ctx context.Context) error {
+func (b *broker) readloop() error {
 	var (
 		err  error
 		resp []byte
@@ -171,8 +166,6 @@ func (b *broker) readloop(ctx context.Context) error {
 		select {
 		case <-b.quit:
 			return ErrQuit
-		case <-ctx.Done():
-			return ctx.Err()
 		case r := <-b.recvQueue:
 			resp, err = Read(r.(io.Reader))
 			if err != nil {

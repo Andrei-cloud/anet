@@ -28,7 +28,7 @@ type PoolItem interface {
 type Factory func() (PoolItem, error)
 
 type pool struct {
-	sync.RWMutex
+	sync.Mutex
 	cap, count  uint32
 	queue       chan PoolItem
 	factoryFunc Factory
@@ -80,10 +80,13 @@ func (p *pool) GetWithContext(ctx context.Context) (item PoolItem, err error) {
 }
 
 func (p *pool) Put(item PoolItem) {
+	p.Lock()
+	defer p.Unlock()
 	if p.closing {
 		p.Release(item)
 		return
 	}
+
 	p.queue <- item
 }
 
@@ -95,9 +98,9 @@ func (p *pool) Release(item PoolItem) {
 }
 
 func (p *pool) Close() {
-	p.RLock()
+	p.Lock()
+	defer p.Unlock()
 	p.closing = true
-	p.RUnlock()
 	for len(p.queue) > 0 {
 		item := <-p.queue
 		p.Release(item)

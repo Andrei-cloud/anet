@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -154,16 +155,21 @@ func BenchmarkBrokerSend(b *testing.B) {
 			broker := anet.NewBroker(p, i, nil)
 			require.NotNil(b, p)
 
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			go broker.Start(ctx)
+			go broker.Start()
 
 			msg := []byte("test")
-			b.ResetTimer()
+			wg := &sync.WaitGroup{}
 
+			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				broker.Send(&msg)
+				wg.Add(1)
+				go func(wg *sync.WaitGroup) {
+					defer wg.Done()
+					_, err := broker.Send(&msg)
+					require.NoError(b, err)
+				}(wg)
 			}
+			wg.Wait()
 		})
 	}
 }

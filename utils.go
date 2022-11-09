@@ -19,10 +19,11 @@ const (
 	LENGTHSIZE = 2
 )
 
-var src = rand.NewSource(time.Now().UnixNano())
 var ErrInvalidMsgLength = fmt.Errorf("invalid message length")
 
 func randString(n int) []byte {
+	var src = rand.NewSource(time.Now().UnixNano())
+
 	sb := bytes.Buffer{}
 	sb.Grow(n)
 	// A src.Int63() generates 63 random bits, enough for letterIdxMax characters!
