@@ -1,33 +1,80 @@
-package anet
+package anet_test
 
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/andrei-cloud/anet"
 	"github.com/stretchr/testify/require"
 )
 
+func StartTestServer() (string, func() error, error) {
+	quit := make(chan struct{})
+	l, err := net.Listen("tcp", ":")
+	if err != nil {
+		return "", nil, err
+	}
+	go func() {
+		for {
+			select {
+			case <-quit:
+				l.Close()
+				return
+			default:
+				conn, err := l.Accept()
+				if err != nil {
+					return
+				}
+				go func(conn net.Conn) {
+					defer conn.Close()
+
+					select {
+					case <-quit:
+						return
+					default:
+						_, err := io.Copy(conn, conn)
+						if err != nil {
+							log.Fatal(err)
+							return
+						}
+					}
+				}(conn)
+			}
+		}
+	}()
+	return l.Addr().String(), func() error {
+		close(quit)
+		return l.Close()
+	}, err
+}
+
 func TestPool(t *testing.T) {
-	factory := func(addr string) Factory {
-		return func() (PoolItem, error) {
+	addr, stop, err := StartTestServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+
+	factory := func(addr string) anet.Factory {
+		return func() (anet.PoolItem, error) {
 			return net.Dial("tcp", addr)
 		}
 	}
 
-	addr, stop := SpinTestServer()
-	defer stop()
-
 	t.Run("NewPool", func(t *testing.T) {
-		p := NewPool(1, factory(addr))
+		p := anet.NewPool(1, factory(addr))
 		require.NotNil(t, p)
 		defer p.Close()
 	})
 
 	t.Run("Get Len Put", func(t *testing.T) {
-		p := NewPool(1, factory(addr))
+		p := anet.NewPool(1, factory(addr))
 		require.NotNil(t, p)
 		defer p.Close()
 
@@ -42,7 +89,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("Get on closed", func(t *testing.T) {
-		p := NewPool(1, factory(addr))
+		p := anet.NewPool(1, factory(addr))
 		require.NotNil(t, p)
 		p.Close()
 
@@ -54,7 +101,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("GetWithContext", func(t *testing.T) {
-		p := NewPool(1, factory(addr))
+		p := anet.NewPool(1, factory(addr))
 		require.NotNil(t, p)
 		defer p.Close()
 
@@ -70,7 +117,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("Release", func(t *testing.T) {
-		p := NewPool(1, factory(addr))
+		p := anet.NewPool(1, factory(addr))
 		require.NotNil(t, p)
 		defer p.Close()
 
@@ -86,52 +133,63 @@ func TestPool(t *testing.T) {
 }
 
 func BenchmarkBrokerSend(b *testing.B) {
-	worker_num := []int{1}
-	factory := func(addr string) Factory {
-		return func() (PoolItem, error) {
+	addr, stop, err := StartTestServer()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer stop()
+
+	worker_num := []int{1, 10, 50, 100, 500, 1000}
+	factory := func(addr string) anet.Factory {
+		return func() (anet.PoolItem, error) {
 			return net.Dial("tcp", addr)
 		}
 	}
 
-	addr, stop := SpinTestServer()
-	defer stop()
-
-	p := NewPool(3, factory(addr))
+	p := anet.NewPool(1, factory(addr))
 	require.NotNil(b, p)
 	defer p.Close()
 
 	for _, i := range worker_num {
 		b.Run(fmt.Sprintf("Workers %d", i), func(b *testing.B) {
-			broker := NewBroker(p, i, nil)
+			broker := anet.NewBroker(p, i, nil)
 			require.NotNil(b, p)
 
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			go broker.Start(ctx)
+			go broker.Start()
 
 			msg := []byte("test")
-			b.ResetTimer()
+			wg := &sync.WaitGroup{}
 
+			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				broker.Send(&msg)
+				wg.Add(1)
+				go func(wg *sync.WaitGroup) {
+					defer wg.Done()
+					_, err := broker.Send(&msg)
+					require.NoError(b, err)
+				}(wg)
 			}
+			wg.Wait()
 		})
 	}
 }
 
 func BenchmarkPool(b *testing.B) {
-	worker_num := []int{1, 50, 100, 1000, 5000}
-	factory := func(addr string) Factory {
-		return func() (PoolItem, error) {
+	addr, stop, err := StartTestServer()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer stop()
+
+	worker_num := []int{1}
+	factory := func(addr string) anet.Factory {
+		return func() (anet.PoolItem, error) {
 			return net.Dial("tcp", addr)
 		}
 	}
 
-	addr, stop := SpinTestServer()
-	defer stop()
-
 	for _, i := range worker_num {
-		p := NewPool(1, factory(addr))
+		p := anet.NewPool(1, factory(addr))
 		require.NotNil(b, p)
 		b.Run(fmt.Sprintf("Workers %d", i), func(b *testing.B) {
 			benchmarkPool(p, b)
@@ -140,7 +198,7 @@ func BenchmarkPool(b *testing.B) {
 	}
 }
 
-func benchmarkPool(p *pool, b *testing.B) {
+func benchmarkPool(p anet.Pool, b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		item, _ := p.Get()
