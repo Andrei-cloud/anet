@@ -14,6 +14,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// func TestMain(m *testing.M) {
+// 	goleak.VerifyTestMain(m)
+// }
+
 func StartTestServer() (string, func() error, error) {
 	quit := make(chan struct{})
 	l, err := net.Listen("tcp", ":")
@@ -59,7 +63,6 @@ func TestPool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer stop()
 
 	factory := func(addr string) anet.Factory {
 		return func() (anet.PoolItem, error) {
@@ -129,7 +132,7 @@ func TestPool(t *testing.T) {
 		p.Release(item)
 		require.Equal(t, 0, p.Len())
 	})
-
+	stop()
 }
 
 func BenchmarkBrokerSend(b *testing.B) {
@@ -152,7 +155,7 @@ func BenchmarkBrokerSend(b *testing.B) {
 
 	for _, i := range worker_num {
 		b.Run(fmt.Sprintf("Workers %d", i), func(b *testing.B) {
-			broker := anet.NewBroker(p, i, nil)
+			broker := anet.NewBroker([]anet.Pool{p}, i, nil)
 			require.NotNil(b, p)
 
 			go broker.Start()

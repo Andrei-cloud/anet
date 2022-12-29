@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
 	"sync"
 
 	"golang.org/x/sync/errgroup"
@@ -29,21 +30,20 @@ type Logger interface {
 type PendingList sync.Map
 
 type broker struct {
-	sendWorkers  int
-	recvWorkers  int
+	mu           sync.Mutex
+	workers      int
 	recvQueue    chan PoolItem
-	compool      Pool
+	compool      []Pool
 	requestQueue chan *Task
 	pending      sync.Map
 	quit         chan struct{}
 }
 
-func NewBroker(p Pool, n int, l Logger) *broker {
+func NewBroker(p []Pool, n int, l Logger) *broker {
 	return &broker{
-		sendWorkers:  n,
+		workers:      n,
 		compool:      p,
-		recvWorkers:  p.Cap(),
-		recvQueue:    make(chan PoolItem, p.Cap()),
+		recvQueue:    make(chan PoolItem, n),
 		requestQueue: make(chan *Task, n),
 		quit:         make(chan struct{}),
 	}
@@ -52,12 +52,9 @@ func NewBroker(p Pool, n int, l Logger) *broker {
 func (b *broker) Start() error {
 	eg := &errgroup.Group{}
 
-	for i := 0; i < b.sendWorkers; i++ {
+	for i := 0; i < b.workers; i++ {
 		eg.Go(func() error {
-			return b.writeloop()
-		})
-		eg.Go(func() error {
-			return b.readloop()
+			return b.loop()
 		})
 	}
 
@@ -68,7 +65,9 @@ func (b *broker) Close() {
 	close(b.quit)
 	close(b.requestQueue)
 	close(b.recvQueue)
-	b.compool.Close()
+	for _, p := range b.compool {
+		p.Close()
+	}
 	b.pending.Range(func(_ any, value any) bool {
 		close(value.(*Task).response)
 		value.(*Task).errCh <- ErrClosingBroker
@@ -119,9 +118,16 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 	return resp, nil
 }
 
-func (b *broker) writeloop() error {
+func (b *broker) pickConnPool() Pool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.compool[rand.Intn(len(b.compool))]
+}
+
+func (b *broker) loop() error {
 	var (
 		cmd  []byte
+		resp []byte
 		task *Task
 	)
 	for {
@@ -129,7 +135,8 @@ func (b *broker) writeloop() error {
 		case <-b.quit:
 			return ErrQuit
 		case task = <-b.requestQueue:
-			w, err := b.compool.Get()
+			p := b.pickConnPool()
+			wr, err := p.Get()
 			if err != nil {
 				select {
 				case <-task.errCh:
@@ -141,39 +148,24 @@ func (b *broker) writeloop() error {
 
 			cmd = b.addTask(task)
 
-			err = Write(w.(io.Writer), cmd)
+			err = Write(wr.(io.Writer), cmd)
 			if err != nil {
 				select {
 				case <-task.errCh:
 				default:
 					task.errCh <- err
 				}
-				b.compool.Release(w)
+				p.Release(wr)
 				continue
 			}
 
-			b.recvQueue <- w
-		}
-	}
-}
-
-func (b *broker) readloop() error {
-	var (
-		err  error
-		resp []byte
-	)
-	for {
-		select {
-		case <-b.quit:
-			return ErrQuit
-		case r := <-b.recvQueue:
-			resp, err = Read(r.(io.Reader))
+			resp, err = Read(wr.(io.Reader))
 			if err != nil {
-				b.compool.Release(r)
+				p.Release(wr)
 				continue
 			}
 			b.respondPending(resp)
-			b.compool.Put(r)
+			p.Put(wr)
 		}
 	}
 }
