@@ -52,8 +52,8 @@ func (b *broker) respondPending(msg []byte) {
 	}
 
 	select {
-	case <-item.(*Task).response:
+	case item.(*Task).response <- response:
 	default:
-		item.(*Task).response <- response
+		// Do nothing if the response channel is closed.
 	}
 }

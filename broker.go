@@ -139,9 +139,8 @@ func (b *broker) loop() error {
 			wr, err := p.Get()
 			if err != nil {
 				select {
-				case <-task.errCh:
+				case task.errCh <- err:
 				default:
-					task.errCh <- err
 				}
 				continue
 			}
@@ -151,9 +150,8 @@ func (b *broker) loop() error {
 			err = Write(wr.(io.Writer), cmd)
 			if err != nil {
 				select {
-				case <-task.errCh:
+				case task.errCh <- err:
 				default:
-					task.errCh <- err
 				}
 				p.Release(wr)
 				continue
