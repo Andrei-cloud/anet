@@ -121,7 +121,13 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 func (b *broker) pickConnPool() Pool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.compool[rand.Intn(len(b.compool))]
+	return b.activePool()[rand.Intn(len(b.compool))]
+}
+
+func (b *broker) activePool() []Pool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.compool
 }
 
 func (b *broker) loop() error {

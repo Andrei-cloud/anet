@@ -64,20 +64,18 @@ func TestPool(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	factory := func(addr string) anet.Factory {
-		return func() (anet.PoolItem, error) {
-			return net.Dial("tcp", addr)
-		}
+	factory := func(addr string) (anet.PoolItem, error) {
+		return net.Dial("tcp", addr)
 	}
 
 	t.Run("NewPool", func(t *testing.T) {
-		p := anet.NewPool(1, factory(addr))
+		p := anet.NewPool(1, factory, addr)
 		require.NotNil(t, p)
 		defer p.Close()
 	})
 
 	t.Run("Get Len Put", func(t *testing.T) {
-		p := anet.NewPool(1, factory(addr))
+		p := anet.NewPool(1, factory, addr)
 		require.NotNil(t, p)
 		defer p.Close()
 
@@ -92,7 +90,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("Get on closed", func(t *testing.T) {
-		p := anet.NewPool(1, factory(addr))
+		p := anet.NewPool(1, factory, addr)
 		require.NotNil(t, p)
 		p.Close()
 
@@ -104,7 +102,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("GetWithContext", func(t *testing.T) {
-		p := anet.NewPool(1, factory(addr))
+		p := anet.NewPool(1, factory, addr)
 		require.NotNil(t, p)
 		defer p.Close()
 
@@ -120,7 +118,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("Release", func(t *testing.T) {
-		p := anet.NewPool(1, factory(addr))
+		p := anet.NewPool(1, factory, addr)
 		require.NotNil(t, p)
 		defer p.Close()
 
@@ -143,13 +141,11 @@ func BenchmarkBrokerSend(b *testing.B) {
 	defer stop()
 
 	worker_num := []int{1, 10, 50, 100, 500, 1000}
-	factory := func(addr string) anet.Factory {
-		return func() (anet.PoolItem, error) {
-			return net.Dial("tcp", addr)
-		}
+	factory := func(addr string) (anet.PoolItem, error) {
+		return net.Dial("tcp", addr)
 	}
 
-	p := anet.NewPool(1, factory(addr))
+	p := anet.NewPool(1, factory, addr)
 	require.NotNil(b, p)
 	defer p.Close()
 
@@ -185,14 +181,12 @@ func BenchmarkPool(b *testing.B) {
 	defer stop()
 
 	worker_num := []int{1}
-	factory := func(addr string) anet.Factory {
-		return func() (anet.PoolItem, error) {
-			return net.Dial("tcp", addr)
-		}
+	factory := func(addr string) (anet.PoolItem, error) {
+		return net.Dial("tcp", addr)
 	}
 
 	for _, i := range worker_num {
-		p := anet.NewPool(1, factory(addr))
+		p := anet.NewPool(1, factory, addr)
 		require.NotNil(b, p)
 		b.Run(fmt.Sprintf("Workers %d", i), func(b *testing.B) {
 			benchmarkPool(p, b)
