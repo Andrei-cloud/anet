@@ -125,8 +125,6 @@ func (b *broker) pickConnPool() Pool {
 }
 
 func (b *broker) activePool() []Pool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	return b.compool
 }
 
