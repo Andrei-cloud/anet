@@ -103,7 +103,11 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 
 	task := b.newTask(req)
 
-	b.requestQueue <- task
+	select {
+	case b.requestQueue <- task:
+	default:
+		return nil, ErrClosingBroker
+	}
 
 	select {
 	case resp = <-task.response:
