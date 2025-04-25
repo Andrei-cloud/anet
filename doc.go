@@ -45,7 +45,7 @@
 //	defer pool.Close()
 //
 //	// Create and start a broker with 3 workers
-//	broker := anet.NewBroker([]anet.Pool{pool}, 3, nil)
+//	broker := anet.NewBroker(pool, 3, nil)
 //	defer broker.Close()
 //	go broker.Start()
 //
