@@ -340,6 +340,9 @@ func (b *broker) loop(workerID int) error {
 			)
 
 			// Ensure wr is not nil before type assertion
+			// NOTE: This assumes the PoolItem returned by the factory is a net.Conn
+			// or implements the necessary methods for Read/Write.
+			// Consider refining the PoolItem interface if more complex types are needed.
 			netConn, ok := wr.(net.Conn)
 			if !ok {
 				b.logger.Printf(
