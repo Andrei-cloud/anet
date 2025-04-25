@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync" // Import the sync package
 	"time"
 
 	"github.com/andrei-cloud/anet"
@@ -97,6 +98,9 @@ func tcpConnectionFactory(addr string) (anet.PoolItem, error) {
 }
 
 func main() {
+	// Set global logger flags to include microseconds for server logs
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
 	serverAddr := "localhost:3000"
 	// Run the server in a goroutine so it doesn't block
 	go func() {
@@ -124,26 +128,36 @@ func main() {
 	}()
 	defer broker.Close() // Ensure broker is closed on exit
 
-	// --- Send Requests ---
-	requests := []string{"hello", "world", "anet test"}
+	// --- Send Requests Concurrently ---
+	requests := []string{"hello", "world", "anet test", "concurrent", "request"}
+	var wg sync.WaitGroup // Use a WaitGroup to wait for all requests
+
 	for _, reqStr := range requests {
-		reqData := []byte(reqStr)
-		log.Printf("Client sending: %s", reqStr)
+		wg.Add(1) // Increment counter for each request
+		go func(requestPayload string) {
+			defer wg.Done() // Decrement counter when goroutine finishes
 
-		// Use SendContext for timeout
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		respData, err := broker.SendContext(ctx, &reqData)
-		cancel() // Release context resources
+			reqData := []byte(requestPayload)
+			log.Printf("Client sending: %s", requestPayload)
 
-		if err != nil {
-			log.Printf("Client error sending '%s': %v", reqStr, err)
-		} else {
-			log.Printf("Client received response for '%s': %s", reqStr, string(respData))
-		}
-		time.Sleep(50 * time.Millisecond) // Small delay between requests
+			// Use SendContext for timeout
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel() // Release context resources when done
+
+			respData, err := broker.SendContext(ctx, &reqData)
+
+			if err != nil {
+				log.Printf("Client error sending '%s': %v", requestPayload, err)
+			} else {
+				log.Printf("Client received response for '%s': %s", requestPayload, string(respData))
+			}
+		}(reqStr) // Pass reqStr as an argument to the goroutine
 	}
 
-	log.Println("Client finished sending requests.")
+	log.Println("Client launched all requests.")
+	wg.Wait() // Wait for all goroutines to complete
+	log.Println("Client finished processing all responses.")
+
 	// Give time for logs to flush, etc.
 	time.Sleep(200 * time.Millisecond)
 }
