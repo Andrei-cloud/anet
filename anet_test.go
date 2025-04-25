@@ -154,8 +154,6 @@ func BenchmarkBrokerSend(b *testing.B) {
 			broker := anet.NewBroker([]anet.Pool{p}, i, nil)
 			require.NotNil(b, p)
 
-			go broker.Start()
-
 			msg := []byte("test")
 			wg := &sync.WaitGroup{}
 

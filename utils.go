@@ -3,45 +3,19 @@ package anet
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"io"
 	"math"
-	"math/rand"
-	"time"
 )
 
-const letterBytes = "1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 const (
-	letterIdxBits = 6                    // 6 bits to represent a letter index
-	letterIdxMask = 1<<letterIdxBits - 1 // All 1-bits, as many as letterIdxBits
-	letterIdxMax  = 63 / letterIdxBits
-
 	LENGTHSIZE = 2
 )
 
-var ErrInvalidMsgLength = fmt.Errorf("invalid message length")
+// ErrInvalidMsgLength indicates a message length header is invalid.
+var ErrInvalidMsgLength = errors.New("invalid message length")
 
-func randString(n int) []byte {
-	var src = rand.NewSource(time.Now().UnixNano())
-
-	sb := bytes.Buffer{}
-	sb.Grow(n)
-	// A src.Int63() generates 63 random bits, enough for letterIdxMax characters!
-	for i, cache, remain := n-1, src.Int63(), letterIdxMax; i >= 0; {
-		if remain == 0 {
-			cache, remain = src.Int63(), letterIdxMax
-		}
-		if idx := int(cache & letterIdxMask); idx < len(letterBytes) {
-			sb.WriteByte(letterBytes[idx])
-			i--
-		}
-		cache >>= letterIdxBits
-		remain--
-	}
-
-	return sb.Bytes()
-}
-
+// Write writes data prefixed with uint16 length header to the writer.
 func Write(w io.Writer, in []byte) error {
 	if len(in) > math.MaxUint16 {
 		return ErrMaxLenExceeded
@@ -60,9 +34,11 @@ func Write(w io.Writer, in []byte) error {
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
+// Read reads data prefixed with uint16 length header from the reader.
 func Read(r io.Reader) ([]byte, error) {
 	var length uint16
 	err := binary.Read(r, binary.BigEndian, &length)
@@ -75,5 +51,6 @@ func Read(r io.Reader) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return message, nil
 }
