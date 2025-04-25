@@ -1,28 +1,3 @@
-# anet - Asynchronous Network Broker & Pool
-
-`anet` is a Go library providing components for efficient, asynchronous communication with network services, primarily featuring a connection pool and a message broker.
-
-## Features
-
-*   **Connection Pooling (`pool.go`)**: Manages a pool of reusable network connections (`PoolItem`) to specified addresses.
-    *   Uses a factory function (`Factory`) to create new connections.
-    *   Limits the number of concurrent connections (`Cap`).
-    *   Provides methods to `Get`, `Put` (return), and `Release` (close) connections.
-    *   Supports context-aware connection retrieval (`GetWithContext`).
-*   **Asynchronous Broker (`broker.go`)**: Coordinates sending requests and receiving responses over pooled connections.
-    *   Uses multiple worker goroutines for concurrent processing.
-    *   Accepts requests via `Send` (blocking) or `SendContext` (supports cancellation/timeouts).
-    *   Automatically prepends a unique Task ID header to outgoing messages.
-    *   Matches incoming responses to pending requests using the Task ID header.
-    *   Handles connection acquisition, writing requests, reading responses, and error management.
-    *   Includes basic logging capabilities (accepts a `Logger` interface).
-*   **Message Framing (`utils.go`)**: Implements simple message framing:
-    *   Prepends a **`uint16`** (2 bytes, BigEndian) header indicating the length of the following message body.
-    *   The broker adds a Task ID (default 4 bytes) *before* the user's request data but *after* the length header. The server is expected to return this Task ID in its response for matching.
-
-## Basic Usage Example
-
-```go
 package main
 
 import (
@@ -172,13 +147,3 @@ func main() {
 	// Give time for logs to flush, etc.
 	time.Sleep(200 * time.Millisecond)
 }
-
-
-```
-
-## Notes
-
-*   The server you connect to *must* read the `uint16` length header and then read the specified number of bytes.
-*   The server *must* include the received Task ID header (first 4 bytes after the length) at the beginning of its response message (after the response length header) for the broker to match the response correctly.
-*   Error handling, particularly around connection failures and timeouts, is crucial for robust applications.
-*   The provided logger is basic; consider using a more structured logging library for production use.

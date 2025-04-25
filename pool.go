@@ -3,6 +3,8 @@ package anet
 import (
 	"context"
 	"errors"
+	"log" // Added import
+	"os"  // Added import
 	"sync"
 	"sync/atomic"
 )
@@ -32,6 +34,7 @@ type pool struct {
 	queue           chan PoolItem
 	factoryFunc     Factory
 	closing         bool
+	logger          *log.Logger
 }
 
 // NewPoolList creates a list of Pool interfaces.
@@ -47,111 +50,176 @@ func NewPoolList(poolCap uint32, f Factory, addrs []string) []Pool { // Return [
 }
 
 // NewPool creates a new connection pool. Returns the Pool interface.
-func NewPool(poolCap uint32, f Factory, addr string) Pool { // Return Pool interface
+func NewPool(poolCap uint32, f Factory, addr string) Pool { // Added return type Pool
 	return &pool{
 		addr:        addr,
 		count:       0,
 		capacity:    poolCap,
 		queue:       make(chan PoolItem, poolCap),
 		factoryFunc: f,
+		logger:      log.New(os.Stderr, "pool: ", log.LstdFlags), // Re-enabled logger
 	}
 }
 
 // Get retrieves an item from the pool.
 func (p *pool) Get() (PoolItem, error) {
-	var item PoolItem
-	var err error
 	if p.closing {
 		return nil, ErrClosing
 	}
 
-	// If the queue is empty and we can create more connections.
-	if len(p.queue) == 0 && p.count < p.capacity {
-		p.Lock() // Lock to safely check count and potentially create.
-		// Double-check count after acquiring lock.
-		if p.count < p.capacity {
-			if item, err = p.factoryFunc(p.addr); err != nil {
-				p.Unlock()
-
-				return nil, err
-			}
-			// Increment count *before* adding to queue to avoid race condition
-			// where another goroutine might see count < cap but item not yet in queue.
-			atomic.AddUint32(&p.count, 1)
-			p.Unlock()      // Unlock before potentially blocking channel send.
-			p.queue <- item // Add the new item to the queue.
-		} else {
-			p.Unlock() // Unlock if we didn't create an item.
+	select {
+	// Try non-blocking read first
+	case item := <-p.queue:
+		if item == nil { // Channel closed while waiting
+			return nil, ErrClosing
 		}
+
+		return item, nil
+	default:
+		// Queue is empty or temporarily blocked, proceed to check capacity
 	}
 
-	// Block until an item is available from the queue.
-	item = <-p.queue
+	p.Lock()
+	if p.count < p.capacity {
+		// Increment count *before* factory call
+		atomic.AddUint32(&p.count, 1)
+		p.Unlock() // Unlock before potentially slow factory call
+
+		item, err := p.factoryFunc(p.addr)
+		if err != nil {
+			atomic.AddUint32(&p.count, ^uint32(0)) // Decrement count on error
+			return nil, err                        // Factory failed
+		}
+
+		// Successfully created a new item
+		return item, nil
+	}
+	// Capacity is reached, must wait for an item to be returned
+	p.Unlock()
+
+	// Blocking wait for an item from the queue
+	item := <-p.queue
+	if item == nil { // Check if channel was closed while waiting
+		return nil, ErrClosing
+	}
 
 	return item, nil
 }
 
 // GetWithContext retrieves an item from the pool with context awareness.
 func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
-	var item PoolItem
-	var err error
 	if p.closing {
 		return nil, ErrClosing
 	}
 
-	if len(p.queue) == 0 && p.count < p.capacity {
-		if item, err = p.factoryFunc(p.addr); err != nil {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	// Try non-blocking read first
+	case item := <-p.queue:
+		if item == nil { // Channel closed
+			return nil, ErrClosing
+		}
+
+		return item, nil
+	default:
+		// Queue is empty or temporarily blocked
+	}
+
+	p.Lock()
+	if p.count < p.capacity {
+		// Increment count *before* factory call
+		atomic.AddUint32(&p.count, 1)
+		p.Unlock() // Unlock before potentially slow factory call
+
+		item, err := p.factoryFunc(p.addr) // Consider context for factory? Maybe not needed.
+		if err != nil {
+			atomic.AddUint32(&p.count, ^uint32(0)) // Decrement count on error
 			return nil, err
 		}
 
-		p.queue <- item
-		atomic.AddUint32(&p.count, 1)
+		// Successfully created a new item
+		return item, nil
 	}
+	// Capacity reached, must wait for an item to be returned
+	p.Unlock()
 
+	// Blocking wait with context awareness
 	select {
 	case <-ctx.Done():
-
 		return nil, ctx.Err()
-	case item = <-p.queue:
-	}
+	case item := <-p.queue:
+		if item == nil { // Check if channel was closed while waiting
+			return nil, ErrClosing
+		}
 
-	return item, nil
+		return item, nil
+	}
 }
 
 // Put returns an item to the pool.
 func (p *pool) Put(item PoolItem) {
-	p.Lock()
-	defer p.Unlock()
-	if p.closing {
-		p.Release(item)
-
+	if item == nil { // Prevent putting nil items back
 		return
 	}
 
-	p.queue <- item
+	p.Lock()
+	// Ensure unlock happens even if p.closing is true early
+	// defer p.Unlock() // Moved unlock inside branches
+
+	if p.closing {
+		p.Unlock() // Unlock before potentially blocking Release->item.Close()
+		p.Release(item)
+		return
+	}
+
+	// Try a non-blocking send. If the queue is full, release the item.
+	select {
+	case p.queue <- item:
+		// Item successfully put back into the queue
+		p.Unlock()
+	default:
+		// Queue is full, release the item instead of blocking
+		p.Unlock() // Unlock before potentially blocking Release->item.Close()
+		p.Release(item)
+	}
 }
 
 // Release closes an item and decrements the pool count.
 func (p *pool) Release(item PoolItem) {
 	if item != nil {
+		// Decrement count *before* closing the item, in case Close() is slow/blocks
+		atomic.AddUint32(&p.count, ^uint32(0)) // Decrement count using atomic operation
 		if err := item.Close(); err != nil {
-			// Optionally log the error here
-			// p.logger.Printf("Error closing pool item: %v", err)
+			// Log error only if logger is configured
+			if p.logger != nil {
+				p.logger.Printf("Error closing pool item: %v", err)
+			}
 		}
-		atomic.AddUint32(&p.count, ^uint32(0))
+		// Removed redundant atomic decrement here
 	}
 }
 
 // Close closes the pool and all its items.
 func (p *pool) Close() {
 	p.Lock()
-	defer p.Unlock()
+	if p.closing {
+		p.Unlock() // Already closing, release lock and return
+		return
+	}
 	p.closing = true
 	close(p.queue) // Close the channel to signal waiters
 
-	// Drain remaining items and close them
+	itemsToClose := make([]PoolItem, 0, len(p.queue)) // Buffer size hint
+	// Drain the queue into a temporary slice while lock is held
 	for item := range p.queue {
-		p.Release(item)
+		itemsToClose = append(itemsToClose, item)
+	}
+	p.Unlock() // Release the lock *before* closing items
+
+	// Now close the items without holding the pool lock
+	for _, item := range itemsToClose {
+		p.Release(item) // Release will decrement count and call item.Close()
 	}
 }
 

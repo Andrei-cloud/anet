@@ -1,6 +1,9 @@
 package anet
 
-import "context"
+import (
+	"context"
+	"encoding/hex" // Import hex package
+)
 
 const taskIDSize = 4
 
@@ -25,34 +28,28 @@ func (t *Task) Context() context.Context {
 	return t.ctx // Added newline
 }
 
-// addTask prepares the command bytes including the task ID header.
-func (b *broker) addTask(task *Task) []byte {
-	b.pending.Store(string(task.taskID), task)
-	cmd := make([]byte, taskIDSize+len(*task.request))
-	copy(cmd[:taskIDSize], task.taskID)
-	copy(cmd[taskIDSize:], *task.request)
-
-	return cmd // Added newline
-}
-
 func (b *broker) failPending(task *Task) {
 	// Attempt to load and delete first to avoid closing channels multiple times if called concurrently.
+	// Log task ID as hex
 	if _, loaded := b.pending.LoadAndDelete(string(task.taskID)); loaded {
 		// Close channels only if we successfully removed the task.
 		close(task.response)
 		close(task.errCh)
-		b.logger.Printf("Task %s failed and removed from pending.", string(task.taskID))
+		b.logger.Printf("Task %s failed and removed from pending.", hex.EncodeToString(task.taskID))
 	} else {
-		b.logger.Printf("Task %s already removed from pending.", string(task.taskID))
+		// Log task ID as hex
+		b.logger.Printf("Task %s already removed from pending.", hex.EncodeToString(task.taskID))
 	}
 }
 
 func (b *broker) respondPending(msg []byte) {
 	if len(msg) < taskIDSize {
 		b.logger.Printf("Received message too short to contain task ID: len=%d", len(msg))
+
 		return // Ignore message if too short.
 	}
-	taskIDKey := string(msg[:taskIDSize])
+	taskIDBytes := msg[:taskIDSize]
+	taskIDKey := string(taskIDBytes) // Keep key as string for map lookup
 	var (
 		item any
 		ok   bool
@@ -60,24 +57,50 @@ func (b *broker) respondPending(msg []byte) {
 
 	// Atomically load and delete the task from the pending map.
 	if item, ok = b.pending.LoadAndDelete(taskIDKey); !ok {
-		b.logger.Printf("Received response for unknown or already completed task ID: %s", taskIDKey)
+		// Log task ID as hex
+		b.logger.Printf(
+			"Received response for unknown or already completed task ID: %s",
+			hex.EncodeToString(taskIDBytes),
+		)
+
 		return // Task not found or already handled.
 	}
 
-	task := item.(*Task)
+	task, ok := item.(*Task)
+	if !ok {
+		// Log or handle the unexpected type if necessary
+		b.logger.Printf(
+			"Unexpected type in pending map for task ID %s",
+			hex.EncodeToString(taskIDBytes),
+		)
+		// Attempt to close channels if possible, though the type is wrong
+		if taskWithError, ok := item.(interface{ ErrorChannel() chan error }); ok {
+			close(taskWithError.ErrorChannel())
+		}
+		if taskWithResponse, ok := item.(interface{ ResponseChannel() chan []byte }); ok {
+			close(taskWithResponse.ResponseChannel())
+		}
+
+		return // Cannot proceed with wrong type
+	}
+
 	response := make([]byte, len(msg)-taskIDSize)
 	copy(response, msg[taskIDSize:])
-
 	select {
 	case task.response <- response:
-		b.logger.Printf("Successfully sent response for task %s", taskIDKey)
+		// Log task ID as hex
+		b.logger.Printf("Successfully sent response for task %s", hex.EncodeToString(taskIDBytes))
 		// Close channels after successfully sending the response.
 		close(task.response)
 		close(task.errCh)
 	default:
 		// This case should ideally not happen with buffered channels,
 		// but log it if it does. It might indicate a logic error.
-		b.logger.Printf("Response channel for task %s blocked unexpectedly.", taskIDKey)
+		// Log task ID as hex
+		b.logger.Printf(
+			"Response channel for task %s blocked unexpectedly.",
+			hex.EncodeToString(taskIDBytes),
+		)
 		// Close channels anyway to clean up.
 		close(task.response)
 		close(task.errCh)
