@@ -3,8 +3,8 @@ package anet
 import (
 	"context"
 	"errors"
-	"log" // Added import
-	"os"  // Added import
+	"log"
+	"os"
 	"sync"
 	"sync/atomic"
 )
@@ -28,17 +28,18 @@ type PoolItem interface {
 type Factory func(string) (PoolItem, error)
 
 type pool struct {
-	sync.Mutex
-	addr            string
-	capacity, count uint32
-	queue           chan PoolItem
-	factoryFunc     Factory
-	closing         bool
-	logger          *log.Logger
+	mu          sync.Mutex
+	addr        string
+	capacity    uint32
+	count       atomic.Uint32 // Change to atomic.Uint32 for better sync
+	queue       chan PoolItem
+	factoryFunc Factory
+	closing     bool
+	logger      *log.Logger
 }
 
 // NewPoolList creates a list of Pool interfaces.
-func NewPoolList(poolCap uint32, f Factory, addrs []string) []Pool { // Return []Pool
+func NewPoolList(poolCap uint32, f Factory, addrs []string) []Pool {
 	pools := make([]Pool, 0, len(addrs))
 
 	for _, addr := range addrs {
@@ -46,26 +47,29 @@ func NewPoolList(poolCap uint32, f Factory, addrs []string) []Pool { // Return [
 		pools = append(pools, p)
 	}
 
-	return pools // Return slice of interfaces
+	return pools
 }
 
 // NewPool creates a new connection pool. Returns the Pool interface.
-func NewPool(poolCap uint32, f Factory, addr string) Pool { // Added return type Pool
+func NewPool(poolCap uint32, f Factory, addr string) Pool {
 	return &pool{
 		addr:        addr,
-		count:       0,
 		capacity:    poolCap,
 		queue:       make(chan PoolItem, poolCap),
 		factoryFunc: f,
-		logger:      log.New(os.Stderr, "pool: ", log.LstdFlags), // Re-enabled logger
+		logger:      log.New(os.Stderr, "pool: ", log.LstdFlags),
 	}
 }
 
 // Get retrieves an item from the pool.
 func (p *pool) Get() (PoolItem, error) {
+	// Check closing state with mutex to avoid race
+	p.mu.Lock()
 	if p.closing {
+		p.mu.Unlock()
 		return nil, ErrClosing
 	}
+	p.mu.Unlock()
 
 	select {
 	// Try non-blocking read first
@@ -79,25 +83,27 @@ func (p *pool) Get() (PoolItem, error) {
 		// Queue is empty or temporarily blocked, proceed to check capacity
 	}
 
-	p.Lock()
-	if p.count < p.capacity {
-		// Increment count *before* factory call
-		atomic.AddUint32(&p.count, 1)
-		p.Unlock() // Unlock before potentially slow factory call
+	// Atomically check and increment count if under capacity
+	currentCount := p.count.Load()
+	if currentCount < p.capacity {
+		// Try to atomically increment the counter
+		if p.count.CompareAndSwap(currentCount, currentCount+1) {
+			// Successfully incremented the counter, create a new item
+			item, err := p.factoryFunc(p.addr)
+			if err != nil {
+				// Decrement count on error
+				p.count.Add(^uint32(0))
 
-		item, err := p.factoryFunc(p.addr)
-		if err != nil {
-			atomic.AddUint32(&p.count, ^uint32(0)) // Decrement count on error
-			return nil, err                        // Factory failed
+				return nil, err
+			}
+
+			return item, nil
 		}
-
-		// Successfully created a new item
-		return item, nil
+		// CompareAndSwap failed, someone else modified the counter
+		// Fall through to blocking wait
 	}
-	// Capacity is reached, must wait for an item to be returned
-	p.Unlock()
 
-	// Blocking wait for an item from the queue
+	// Capacity reached or CompareAndSwap failed, must wait for an item
 	item := <-p.queue
 	if item == nil { // Check if channel was closed while waiting
 		return nil, ErrClosing
@@ -108,9 +114,13 @@ func (p *pool) Get() (PoolItem, error) {
 
 // GetWithContext retrieves an item from the pool with context awareness.
 func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
+	// Check closing state with mutex to avoid race
+	p.mu.Lock()
 	if p.closing {
+		p.mu.Unlock()
 		return nil, ErrClosing
 	}
+	p.mu.Unlock()
 
 	select {
 	case <-ctx.Done():
@@ -126,23 +136,25 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 		// Queue is empty or temporarily blocked
 	}
 
-	p.Lock()
-	if p.count < p.capacity {
-		// Increment count *before* factory call
-		atomic.AddUint32(&p.count, 1)
-		p.Unlock() // Unlock before potentially slow factory call
+	// Atomically check and increment count if under capacity
+	currentCount := p.count.Load()
+	if currentCount < p.capacity {
+		// Try to atomically increment the counter
+		if p.count.CompareAndSwap(currentCount, currentCount+1) {
+			// Successfully incremented the counter, create a new item
+			item, err := p.factoryFunc(p.addr)
+			if err != nil {
+				// Decrement count on error
+				p.count.Add(^uint32(0))
 
-		item, err := p.factoryFunc(p.addr) // Consider context for factory? Maybe not needed.
-		if err != nil {
-			atomic.AddUint32(&p.count, ^uint32(0)) // Decrement count on error
-			return nil, err
+				return nil, err
+			}
+
+			return item, nil
 		}
-
-		// Successfully created a new item
-		return item, nil
+		// CompareAndSwap failed, someone else modified the counter
+		// Fall through to blocking wait
 	}
-	// Capacity reached, must wait for an item to be returned
-	p.Unlock()
 
 	// Blocking wait with context awareness
 	select {
@@ -163,12 +175,9 @@ func (p *pool) Put(item PoolItem) {
 		return
 	}
 
-	p.Lock()
-	// Ensure unlock happens even if p.closing is true early
-	// defer p.Unlock() // Moved unlock inside branches
-
+	p.mu.Lock()
 	if p.closing {
-		p.Unlock() // Unlock before potentially blocking Release->item.Close()
+		p.mu.Unlock() // Unlock before potentially blocking Release->item.Close()
 		p.Release(item)
 		return
 	}
@@ -177,10 +186,10 @@ func (p *pool) Put(item PoolItem) {
 	select {
 	case p.queue <- item:
 		// Item successfully put back into the queue
-		p.Unlock()
+		p.mu.Unlock()
 	default:
 		// Queue is full, release the item instead of blocking
-		p.Unlock() // Unlock before potentially blocking Release->item.Close()
+		p.mu.Unlock() // Unlock before potentially blocking Release->item.Close()
 		p.Release(item)
 	}
 }
@@ -188,34 +197,33 @@ func (p *pool) Put(item PoolItem) {
 // Release closes an item and decrements the pool count.
 func (p *pool) Release(item PoolItem) {
 	if item != nil {
-		// Decrement count *before* closing the item, in case Close() is slow/blocks
-		atomic.AddUint32(&p.count, ^uint32(0)) // Decrement count using atomic operation
+		// Decrement count using atomic operations
+		p.count.Add(^uint32(0))
 		if err := item.Close(); err != nil {
 			// Log error only if logger is configured
 			if p.logger != nil {
 				p.logger.Printf("Error closing pool item: %v", err)
 			}
 		}
-		// Removed redundant atomic decrement here
 	}
 }
 
 // Close closes the pool and all its items.
 func (p *pool) Close() {
-	p.Lock()
+	p.mu.Lock()
 	if p.closing {
-		p.Unlock() // Already closing, release lock and return
+		p.mu.Unlock() // Already closing, release lock and return
 		return
 	}
 	p.closing = true
 	close(p.queue) // Close the channel to signal waiters
 
-	itemsToClose := make([]PoolItem, 0, len(p.queue)) // Buffer size hint
+	itemsToClose := make([]PoolItem, 0, cap(p.queue)) // Use cap instead of len
 	// Drain the queue into a temporary slice while lock is held
 	for item := range p.queue {
 		itemsToClose = append(itemsToClose, item)
 	}
-	p.Unlock() // Release the lock *before* closing items
+	p.mu.Unlock() // Release the lock *before* closing items
 
 	// Now close the items without holding the pool lock
 	for _, item := range itemsToClose {
@@ -224,7 +232,11 @@ func (p *pool) Close() {
 }
 
 // Len returns the current number of items in the pool.
-func (p *pool) Len() int { return int(p.count) }
+func (p *pool) Len() int {
+	return int(p.count.Load())
+}
 
 // Cap returns the capacity of the pool.
-func (p *pool) Cap() int { return int(p.capacity) }
+func (p *pool) Cap() int {
+	return int(p.capacity)
+}

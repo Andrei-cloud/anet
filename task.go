@@ -8,11 +8,13 @@ import (
 const taskIDSize = 4
 
 // Task represents a single request/response operation.
-// Storing context here is generally discouraged (containedctx lint error),
-// but necessary for GetWithContext in the broker loop without major refactoring.
-// Consider passing context explicitly if this becomes problematic.
+// NOTE: The linter flags a "containedctx" warning because storing context in a struct
+// is generally discouraged. However, in this specific case, it is necessary for our
+// design to allow context-aware cancellation when a request is in the broker queue.
+// Alternative approaches would require significant refactoring of the broker architecture.
+// If this becomes problematic, consider redesigning to pass context explicitly.
 type Task struct {
-	ctx      context.Context // Context for cancellation/timeout.
+	ctx      context.Context //nolint:containedctx // Context for cancellation/timeout.
 	taskID   []byte          // Unique ID for matching responses.
 	request  *[]byte         // Request payload.
 	response chan []byte     // Channel to send response back.
@@ -25,7 +27,7 @@ func (t *Task) Context() context.Context {
 		return context.Background()
 	}
 
-	return t.ctx // Added newline
+	return t.ctx
 }
 
 func (b *broker) failPending(task *Task) {

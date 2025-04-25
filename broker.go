@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -42,11 +43,13 @@ type broker struct {
 	compool      []Pool
 	requestQueue chan *Task
 	pending      sync.Map
-	quit         chan struct{}
-	logger       Logger
-	rng          *rand.Rand
-	wg           sync.WaitGroup
-	closing      bool
+	//nolint:containedctx // Necessary for task cancellation within the broker queue.
+	ctx     context.Context
+	cancel  context.CancelFunc
+	logger  Logger
+	rng     *rand.Rand
+	wg      sync.WaitGroup
+	closing atomic.Bool
 }
 
 // NoopLogger provides a default logger that does nothing.
@@ -65,13 +68,15 @@ func NewBroker(p []Pool, n int, l Logger) Broker {
 	}
 	rngSource := rand.NewSource(time.Now().UnixNano())
 	rng := rand.New(rngSource)
+	ctx, cancel := context.WithCancel(context.Background())
 
 	return &broker{
 		workers:      n,
 		compool:      p,
 		recvQueue:    make(chan PoolItem, n),
 		requestQueue: make(chan *Task, n),
-		quit:         make(chan struct{}),
+		ctx:          ctx,
+		cancel:       cancel,
 		logger:       l,
 		rng:          rng,
 	}
@@ -103,12 +108,12 @@ func (b *broker) Start() error {
 // Close shuts down the broker and associated connection pools.
 func (b *broker) Close() {
 	b.mu.Lock()
-	if b.closing {
+	if b.closing.Load() {
 		b.mu.Unlock()
 		return // Already closing
 	}
-	b.closing = true
-	close(b.quit) // Signal workers to stop accepting new tasks *before* closing requestQueue
+	b.closing.Store(true)
+	b.cancel() // signal loop via context cancel
 	b.mu.Unlock()
 
 	// Wait for all workers to finish processing their current task (if any)
@@ -124,8 +129,10 @@ func (b *broker) Close() {
 		if !ok {
 			// Log or handle the unexpected type if necessary
 			b.logger.Printf("Unexpected type in pending map for key %v", key)
+
 			return true // Continue ranging
 		}
+
 		select {
 		case task.errCh <- ErrClosingBroker:
 		default:
@@ -154,7 +161,7 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 
 	// Lock to check closing status and potentially send
 	b.mu.Lock()
-	if b.closing {
+	if b.closing.Load() {
 		b.mu.Unlock()
 		// Use the specific error for closing broker
 		return nil, ErrClosingBroker
@@ -168,7 +175,7 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 	case b.requestQueue <- task:
 		// Successfully sent task
 		b.mu.Unlock() // Unlock *after* successful send
-	case <-b.quit:
+	case <-b.ctx.Done():
 		// Broker quit while trying to send
 		b.mu.Unlock()       // Unlock before failing
 		b.failPending(task) // Clean up the task
@@ -202,7 +209,7 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 
 	// Lock to check closing status and potentially send
 	b.mu.Lock()
-	if b.closing {
+	if b.closing.Load() {
 		b.mu.Unlock()
 		// Use the specific error for closing broker
 		return nil, ErrClosingBroker
@@ -216,7 +223,7 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 	case b.requestQueue <- task:
 		// Successfully sent task
 		b.mu.Unlock() // Unlock *after* successful send
-	case <-b.quit:
+	case <-b.ctx.Done():
 		// Broker quit while trying to send
 		b.mu.Unlock()       // Unlock before failing
 		b.failPending(task) // Clean up the task
@@ -272,7 +279,7 @@ func (b *broker) loop(workerID int) error {
 	)
 	for {
 		select {
-		case <-b.quit: // Prioritize quit signal
+		case <-b.ctx.Done(): // Prioritize quit signal
 			b.logger.Printf("Worker %d received quit signal", workerID)
 			return ErrQuit
 		case task, ok := <-b.requestQueue:
