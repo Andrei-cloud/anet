@@ -2,58 +2,67 @@
 // network communication with framed messages, connection pooling,
 // and a high-throughput broker.
 //
-// Features:
+// Key Components:
 //
 // 1. Message Framing (utils.go):
-//   - Write and Read functions to encode and decode messages
-//     with a 2-byte big-endian length header.
-//   - ErrInvalidMsgLength and ErrMaxLenExceeded for error reporting.
+//   - Encodes messages with 2-byte big-endian length header.
+//   - Write and Read functions handle framing automatically.
+//   - Error handling for invalid length (ErrInvalidMsgLength) and size limits (ErrMaxLenExceeded).
 //
 // 2. Connection Pool (pool.go):
-//   - Pool interface for managing reusable network connections.
-//   - Factory function type to create new PoolItem instances.
-//   - NewPool and NewPoolList to create pools with context-aware
-//     connection retrieval (GetWithContext) and lifecycle control.
-//   - Support for safe concurrent access, capacity limits, and graceful
-//     shutdown via Close().
-//   - ErrClosing indicates operations on a closed pool.
+//   - Manages reusable network connections with safe concurrent access.
+//   - Interface-based design with PoolItem and Factory abstractions.
+//   - Context-aware connection retrieval with GetWithContext.
+//   - Built-in connection validation and health checks.
+//   - Graceful shutdown with proper resource cleanup.
 //
 // 3. Asynchronous Broker (broker.go):
-//   - Broker interface for sending requests and receiving
-//     responses over pooled connections.
-//   - Send (blocking) and SendContext (with cancellation/timeouts)
-//     methods for submitting requests.
-//   - NewBroker to create a broker with multiple workers and
-//     optional Logger for structured logging.
-//   - Correlates requests and responses using a Task ID header.
-//   - ErrTimeout, ErrQuit, ErrClosingBroker, ErrNoPoolsAvailable
-//     for robust error handling.
+//   - Coordinates request/response over pooled connections.
+//   - Multiple worker goroutines for high throughput.
+//   - Automatic task ID generation and correlation.
+//   - Context support for timeouts and cancellation.
+//   - Structured logging interface for observability.
 //
-// Basic Usage:
+// Error Handling:
+//   - ErrTimeout: Response not received within deadline.
+//   - ErrQuit: Broker is shutting down normally.
+//   - ErrClosingBroker: Broker is in process of closing.
+//   - ErrNoPoolsAvailable: No connection pools are available.
+//   - ErrClosing: Pool is shutting down.
+//   - ErrInvalidMsgLength: Message length header is invalid.
+//   - ErrMaxLenExceeded: Message exceeds maximum allowed size.
 //
-//	// Create a connection factory
+// Basic Usage Example:
+//
+//	// Create connection factory
 //	factory := func(addr string) (anet.PoolItem, error) {
-//	    conn, err := net.Dial("tcp", addr)
+//	    conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 //	    if err != nil {
 //	        return nil, err
 //	    }
 //	    return conn, nil
 //	}
 //
-//	// Initialize a pool
+//	// Initialize pool with capacity
 //	pool := anet.NewPool(5, factory, "localhost:8080")
 //	defer pool.Close()
 //
-//	// Create and start a broker with 3 workers
-//	broker := anet.NewBroker(pool, 3, nil)
+//	// Create broker with workers
+//	broker := anet.NewBroker([]anet.Pool{pool}, 3, nil)
 //	defer broker.Close()
+//
+//	// Start broker in background
 //	go broker.Start()
 //
-//	// Send a request and wait for a response
-//	req := []byte("hello world")
-//	resp, err := broker.Send(&req)
+//	// Send request with timeout
+//	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+//	defer cancel()
+//
+//	req := []byte("hello")
+//	resp, err := broker.SendContext(ctx, &req)
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
+//
 //	fmt.Printf("Response: %s\n", resp)
 package anet

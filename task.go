@@ -33,7 +33,7 @@ func (t *Task) ID() string {
 	return hex.EncodeToString(t.taskID)
 }
 
-// Created returns the time the task was created.
+// Created returns the task creation time.
 func (t *Task) Created() time.Time {
 	return t.created
 }

@@ -17,7 +17,7 @@ var (
 	// ErrTimeout indicates a response was not received within the deadline.
 	ErrTimeout = errors.New("timeout on response")
 
-	// ErrQuit indicates the broker is shutting down.
+	// ErrQuit indicates the broker is shutting down normally.
 	ErrQuit = errors.New("broker is quiting")
 
 	// ErrClosingBroker indicates the broker is in the process of closing.
@@ -37,25 +37,24 @@ type Broker interface {
 
 // Logger handles structured logging for the broker.
 type Logger interface {
-	Print(v ...any)                 // Info level.
-	Printf(format string, v ...any) // Info level formatted.
-	Infof(format string, v ...any)  // Info level with formatting.
-	Warnf(format string, v ...any)  // Warning level.
-	Errorf(format string, v ...any) // Error level.
+	Print(v ...any)                 // Info level
+	Printf(format string, v ...any) // Info level formatted
+	Infof(format string, v ...any)  // Info level with formatting
+	Warnf(format string, v ...any)  // Warning level
+	Errorf(format string, v ...any) // Error level
 }
 
-type PendingList sync.Map
-
+// broker implements the Broker interface.
 type broker struct {
 	mu           sync.Mutex
-	connMu       sync.RWMutex // Add mutex for connection operations.
+	connMu       sync.RWMutex
 	workers      int
 	recvQueue    chan PoolItem
 	compool      []Pool
 	requestQueue chan *Task
 	pending      sync.Map
-	activeConns  sync.Map // map[string]net.Conn.
-	//nolint:containedctx // Necessary for task cancellation within the broker queue.
+	activeConns  sync.Map
+	//nolint:containedctx // Necessary for task cancellation within broker queue.
 	ctx     context.Context
 	cancel  context.CancelFunc
 	logger  Logger
@@ -64,25 +63,16 @@ type broker struct {
 	closing atomic.Bool
 }
 
-// NoopLogger provides a default logger that does nothing.
+// NoopLogger provides a default no-op logger.
 type NoopLogger struct{}
 
-// Print does nothing.
-func (l *NoopLogger) Print(_ ...any) {}
-
-// Printf does nothing.
+func (l *NoopLogger) Print(_ ...any)            {}
 func (l *NoopLogger) Printf(_ string, _ ...any) {}
-
-// Infof does nothing.
-func (l *NoopLogger) Infof(_ string, _ ...any) {}
-
-// Warnf does nothing.
-func (l *NoopLogger) Warnf(_ string, _ ...any) {}
-
-// Errorf does nothing.
+func (l *NoopLogger) Infof(_ string, _ ...any)  {}
+func (l *NoopLogger) Warnf(_ string, _ ...any)  {}
 func (l *NoopLogger) Errorf(_ string, _ ...any) {}
 
-// NewBroker creates a new message broker. Returns the Broker interface.
+// NewBroker creates a new message broker.
 func NewBroker(p []Pool, n int, l Logger) Broker {
 	if l == nil {
 		l = &NoopLogger{}
@@ -103,6 +93,7 @@ func NewBroker(p []Pool, n int, l Logger) Broker {
 	}
 }
 
+// Start launches worker goroutines to process requests.
 func (b *broker) Start() error {
 	eg := &errgroup.Group{}
 	b.logger.Infof("Broker starting with %d workers...", b.workers)
@@ -127,85 +118,8 @@ func (b *broker) Start() error {
 	return err
 }
 
-// Close shuts down the broker and associated connection pools.
-func (b *broker) Close() {
-	b.mu.Lock()
-	if b.closing.Load() {
-		b.mu.Unlock()
-		return
-	}
-	b.closing.Store(true)
-	b.cancel()
-	b.mu.Unlock()
-
-	// Close all active connections immediately.
-	b.connMu.Lock()
-	b.activeConns.Range(func(key, value any) bool {
-		if conn, ok := value.(net.Conn); ok {
-			if err := conn.Close(); err != nil {
-				// Use key as string after type assertion
-				if keyStr, ok := key.(string); ok {
-					b.logger.Warnf(
-						"Error closing connection for task %s: %v",
-						keyStr,
-						err,
-					)
-				}
-			}
-		}
-		b.activeConns.Delete(key)
-
-		return true
-	})
-	b.connMu.Unlock()
-
-	// Wait for workers to finish with a timeout.
-	done := make(chan struct{})
-	go func() {
-		b.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		b.logger.Warnf("Timeout waiting for workers to finish, forcing close.")
-	}
-
-	// Now that workers are stopped, safely close the request channel.
-	close(b.requestQueue)
-
-	// Fail any remaining pending tasks.
-	b.pending.Range(func(key, value any) bool {
-		task, ok := value.(*Task)
-		if !ok {
-			return true
-		}
-		select {
-		case task.errCh <- ErrClosingBroker:
-		default:
-		}
-		close(task.response)
-		close(task.errCh)
-		b.pending.Delete(key)
-
-		return true
-	})
-
-	// Close the underlying connection pools.
-	for i, p := range b.compool {
-		p.Close()
-		_ = i
-	}
-
-	b.logger.Print("Broker closed.")
-}
-
+// Send sends a request and waits for the response.
 func (b *broker) Send(req *[]byte) ([]byte, error) {
-	var (
-		resp []byte
-		err  error
-	)
 	task := b.newTask(context.Background(), req)
 
 	b.mu.Lock()
@@ -230,19 +144,15 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 	}
 
 	select {
-	case resp = <-task.response:
+	case resp := <-task.response:
 		return resp, nil
-	case err = <-task.errCh:
+	case err := <-task.errCh:
 		return nil, err
 	}
 }
 
+// SendContext sends a request with context support.
 func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
-	var (
-		resp []byte
-		err  error
-	)
-
 	task := b.newTask(ctx, req)
 
 	b.mu.Lock()
@@ -271,9 +181,9 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 	}
 
 	select {
-	case resp = <-task.response:
+	case resp := <-task.response:
 		return resp, nil
-	case err = <-task.errCh:
+	case err := <-task.errCh:
 		return nil, err
 	case <-ctx.Done():
 		b.failPending(task)
@@ -281,21 +191,71 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 	}
 }
 
-func (b *broker) pickConnPool() Pool {
+// Close shuts down the broker and associated pools.
+func (b *broker) Close() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(b.compool) == 0 {
-		return nil
+	if b.closing.Load() {
+		b.mu.Unlock()
+		return
+	}
+	b.closing.Store(true)
+	b.cancel()
+	b.mu.Unlock()
+
+	b.connMu.Lock()
+	b.activeConns.Range(func(key, value any) bool {
+		if conn, ok := value.(net.Conn); ok {
+			if err := conn.Close(); err != nil {
+				if keyStr, ok := key.(string); ok {
+					b.logger.Warnf("Error closing connection for task %s: %v", keyStr, err)
+				}
+			}
+		}
+		b.activeConns.Delete(key)
+
+		return true
+	})
+	b.connMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		b.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		b.logger.Warnf("Timeout waiting for workers to finish, forcing close.")
 	}
 
-	return b.activePool()[b.rng.Intn(len(b.compool))]
+	close(b.requestQueue)
+
+	b.pending.Range(func(key, value any) bool {
+		task, ok := value.(*Task)
+		if !ok {
+			return true
+		}
+		select {
+		case task.errCh <- ErrClosingBroker:
+		default:
+		}
+		close(task.response)
+		close(task.errCh)
+		b.pending.Delete(key)
+
+		return true
+	})
+
+	for _, p := range b.compool {
+		p.Close()
+	}
+
+	b.logger.Print("Broker closed.")
 }
 
-func (b *broker) activePool() []Pool {
-	return b.compool
-}
+// Internal methods.
 
-// loop is the main worker loop for processing tasks.
 func (b *broker) loop(workerID int) error {
 	for {
 		select {
@@ -318,8 +278,7 @@ func (b *broker) loop(workerID int) error {
 			b.connMu.RUnlock()
 
 			if p == nil {
-				err := ErrNoPoolsAvailable
-				b.trySendError(task, err)
+				b.trySendError(task, ErrNoPoolsAvailable)
 
 				continue
 			}
@@ -353,7 +312,6 @@ func (b *broker) loop(workerID int) error {
 	}
 }
 
-// handleConnection manages a single connection operation.
 func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 	netConn, ok := wr.(net.Conn)
 	if !ok {
@@ -375,33 +333,28 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 	cmd := b.addTask(task)
 
 	if b.closing.Load() {
-		err := ErrClosingBroker
-		b.trySendError(task, err)
-		return err
+		b.trySendError(task, ErrClosingBroker)
+		return ErrClosingBroker
 	}
-
-	taskCtx := task.Context()
 
 	writeDeadline := time.Now().Add(5 * time.Second)
 	if err := netConn.SetWriteDeadline(writeDeadline); err != nil {
-		wrappedErr := fmt.Errorf("setting write deadline: %w", err)
-		b.trySendError(task, wrappedErr)
-		return wrappedErr
+		b.trySendError(task, fmt.Errorf("setting write deadline: %w", err))
+		return err
 	}
 
 	if err := Write(netConn, cmd); err != nil {
-		wrappedErr := fmt.Errorf("writing to connection: %w", err)
-		b.trySendError(task, wrappedErr)
-		return wrappedErr
+		b.trySendError(task, fmt.Errorf("writing to connection: %w", err))
+		return err
 	}
 
 	readDeadline := time.Now().Add(5 * time.Second)
 	if err := netConn.SetReadDeadline(readDeadline); err != nil {
-		wrappedErr := fmt.Errorf("setting read deadline: %w", err)
-		b.trySendError(task, wrappedErr)
-		return wrappedErr
+		b.trySendError(task, fmt.Errorf("setting read deadline: %w", err))
+		return err
 	}
 
+	taskCtx := task.Context()
 	if taskCtx != nil {
 		done := make(chan struct{})
 		var readErr error
@@ -435,18 +388,27 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 		b.respondPending(resp)
 	}
 
-	// Ignore error when clearing deadline as connection will be reused
 	_ = netConn.SetDeadline(time.Time{})
 
 	return nil
 }
 
-// trySendError attempts to send an error to the task's error channel.
-func (b *broker) trySendError(task *Task, err error) {
-	defer func() {
-		_ = recover() // Explicitly ignore recover value
-	}()
+func (b *broker) pickConnPool() Pool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.compool) == 0 {
+		return nil
+	}
 
+	return b.activePool()[b.rng.Intn(len(b.compool))]
+}
+
+func (b *broker) activePool() []Pool {
+	return b.compool
+}
+
+func (b *broker) trySendError(task *Task, err error) {
+	defer func() { _ = recover() }()
 	select {
 	case task.errCh <- err:
 		b.failPending(task)
@@ -454,7 +416,6 @@ func (b *broker) trySendError(task *Task, err error) {
 	}
 }
 
-// respondPending finds the pending task by response header and sends the response.
 func (b *broker) respondPending(resp []byte) {
 	if len(resp) < taskIDSize {
 		return
@@ -470,9 +431,7 @@ func (b *broker) respondPending(resp []byte) {
 
 		sent := false
 		func() {
-			defer func() {
-				_ = recover() // Explicitly ignore recover value
-			}()
+			defer func() { _ = recover() }()
 			select {
 			case task.response <- resp[taskIDSize:]:
 				sent = true
@@ -486,20 +445,15 @@ func (b *broker) respondPending(resp []byte) {
 	}
 }
 
-// failPending removes a task from the pending list without sending a response.
-// Used when an error occurs before a response is generated or context is canceled.
 func (b *broker) failPending(task *Task) {
 	b.pending.Delete(string(task.taskID))
 	func() {
-		defer func() {
-			_ = recover() // Explicitly ignore recover value
-		}()
+		defer func() { _ = recover() }()
 		close(task.response)
 		close(task.errCh)
 	}()
 }
 
-// newTask creates a new task, storing the context.
 func (b *broker) newTask(ctx context.Context, r *[]byte) *Task {
 	taskIDBytes := make([]byte, taskIDSize)
 	b.mu.Lock()
@@ -512,11 +466,10 @@ func (b *broker) newTask(ctx context.Context, r *[]byte) *Task {
 		request:  r,
 		response: make(chan []byte, 1),
 		errCh:    make(chan error, 1),
+		created:  time.Now(),
 	}
 }
 
-// addTask prepares the command bytes including the task ID header.
-// It no longer adds the task to the pending map, as that's now done in Send/SendContext.
 func (b *broker) addTask(task *Task) []byte {
 	cmd := make([]byte, taskIDSize+len(*task.request))
 	copy(cmd[:taskIDSize], task.taskID)

@@ -18,16 +18,14 @@ var ErrInvalidMsgLength = errors.New("invalid message length")
 // ErrMaxLenExceeded indicates the message length exceeds the maximum allowed.
 var ErrMaxLenExceeded = errors.New("maximum message length exceeded")
 
-// Write writes data prefixed with a big-endian length header of configured size.
+// Write writes data prefixed with a big-endian length header.
 func Write(w io.Writer, in []byte) error {
-	// Validate message length against header size.
 	maxLen := uint64(1<<(8*LENGTHSIZE)) - 1
 	if uint64(len(in)) > maxLen {
 		return ErrMaxLenExceeded
 	}
 
 	out := &bytes.Buffer{}
-	// Write length header based on configured size.
 	switch LENGTHSIZE {
 	case 2:
 		if err := binary.Write(out, binary.BigEndian, uint16(len(in))); err != nil {
@@ -50,7 +48,7 @@ func Write(w io.Writer, in []byte) error {
 	return nil
 }
 
-// Read reads data prefixed with a big-endian length header of configured size.
+// Read reads data prefixed with a big-endian length header.
 func Read(r io.Reader) ([]byte, error) {
 	var length uint64
 	switch LENGTHSIZE {
@@ -75,7 +73,6 @@ func Read(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 
-	// If message contains nested length header, unwrap it.
 	if len(message) > LENGTHSIZE {
 		var innerLen uint64
 		switch LENGTHSIZE {

@@ -44,10 +44,9 @@ type pool struct {
 	logger      *os.File
 }
 
-// NewPoolList creates a list of Pool interfaces.
+// NewPoolList creates a list of Pool interfaces from a slice of addresses.
 func NewPoolList(poolCap uint32, f Factory, addrs []string) []Pool {
 	pools := make([]Pool, 0, len(addrs))
-
 	for _, addr := range addrs {
 		p := NewPool(poolCap, f, addr)
 		pools = append(pools, p)
@@ -56,7 +55,7 @@ func NewPoolList(poolCap uint32, f Factory, addrs []string) []Pool {
 	return pools
 }
 
-// NewPool creates a new connection pool. Returns the Pool interface.
+// NewPool creates a new connection pool.
 func NewPool(poolCap uint32, f Factory, addr string) Pool {
 	p := &pool{
 		addr:        addr,
@@ -69,20 +68,17 @@ func NewPool(poolCap uint32, f Factory, addr string) Pool {
 	return p
 }
 
-// validateConnection performs basic connection check.
+// validateConnection performs basic connection health check.
 func (p *pool) validateConnection(item PoolItem) bool {
 	if item == nil {
 		return false
 	}
 
-	// Check if connection is alive.
 	if conn, ok := item.(net.Conn); ok {
-		// Simply check if connection is nil or closed.
 		if conn == nil {
 			return false
 		}
 
-		// Enable keep-alive to detect stale connections.
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			if err := tcpConn.SetKeepAlive(true); err != nil {
 				return false
@@ -102,7 +98,6 @@ func (p *pool) Get() (PoolItem, error) {
 	}
 	p.mu.Unlock()
 
-	// Try to reuse idle connections.
 	select {
 	case item := <-p.queue:
 		if item == nil {
@@ -117,7 +112,6 @@ func (p *pool) Get() (PoolItem, error) {
 	default:
 	}
 
-	// Grow pool if under capacity.
 	current := p.count.Load()
 	if current < p.capacity {
 		if p.count.CompareAndSwap(current, current+1) {
@@ -131,7 +125,6 @@ func (p *pool) Get() (PoolItem, error) {
 		}
 	}
 
-	// Block until an item is available.
 	for {
 		item := <-p.queue
 		if item == nil {
@@ -146,7 +139,7 @@ func (p *pool) Get() (PoolItem, error) {
 	}
 }
 
-// GetWithContext retrieves an item from the pool with context awareness.
+// GetWithContext retrieves an item with context awareness.
 func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 	p.mu.Lock()
 	if p.closing {
@@ -155,7 +148,6 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 	}
 	p.mu.Unlock()
 
-	// Try to reuse idle connections.
 	select {
 	case item := <-p.queue:
 		if item == nil {
@@ -170,14 +162,12 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 	default:
 	}
 
-	// Check context before growing pool.
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
 
-	// Grow pool if under capacity.
 	current := p.count.Load()
 	if current < p.capacity {
 		if p.count.CompareAndSwap(current, current+1) {
@@ -191,7 +181,6 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 		}
 	}
 
-	// Block until item available or context done.
 	for {
 		select {
 		case <-ctx.Done():
@@ -223,14 +212,12 @@ func (p *pool) Put(item PoolItem) {
 		return
 	}
 
-	// Validate connection before returning to pool.
 	if !p.validateConnection(item) {
 		p.mu.Unlock()
 		p.Release(item)
 		return
 	}
 
-	// Try non-blocking put or release.
 	select {
 	case p.queue <- item:
 		p.mu.Unlock()
@@ -240,15 +227,13 @@ func (p *pool) Put(item PoolItem) {
 	}
 }
 
-// Release closes an item and decrements the pool count.
+// Release closes an item and decrements pool count.
 func (p *pool) Release(item PoolItem) {
 	if item != nil {
 		p.count.Add(^uint32(0))
 		if err := item.Close(); err != nil {
-			// Write error to logger if not nil
 			if p.logger != nil {
 				if _, err := fmt.Fprintf(p.logger, "Error closing pool item: %v\n", err); err != nil {
-					// If we can't write to logger, write to stderr as last resort
 					_, _ = fmt.Fprintf(os.Stderr, "Error writing to logger: %v\n", err)
 				}
 			}
