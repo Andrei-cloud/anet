@@ -124,7 +124,7 @@ func (b *broker) Close() {
 	close(b.requestQueue)
 
 	// Fail any remaining pending tasks that were never picked up by a worker
-	b.pending.Range(func(key any, value any) bool {
+	b.pending.Range(func(key, value any) bool {
 		task, ok := value.(*Task)
 		if !ok {
 			// Log or handle the unexpected type if necessary

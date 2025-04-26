@@ -91,6 +91,7 @@ func (p *pool) Get() (PoolItem, error) {
 		if item == nil {
 			return nil, ErrClosing
 		}
+
 		return item, nil
 	default:
 	}
@@ -100,6 +101,7 @@ func (p *pool) Get() (PoolItem, error) {
 	if item == nil {
 		return nil, ErrClosing
 	}
+
 	return item, nil
 }
 
@@ -142,6 +144,7 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 		if item == nil {
 			return nil, ErrClosing
 		}
+
 		return item, nil
 	default:
 	}
@@ -154,6 +157,7 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 		if item == nil {
 			return nil, ErrClosing
 		}
+
 		return item, nil
 	}
 }
