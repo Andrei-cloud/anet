@@ -34,13 +34,13 @@ type Factory func(string) (PoolItem, error)
 
 // pool implements the Pool interface.
 type pool struct {
-	mu          sync.Mutex
+	mu          sync.RWMutex // Changed from sync.Mutex to sync.RWMutex
 	addr        string
 	capacity    uint32
 	count       atomic.Uint32
 	queue       chan PoolItem
 	factoryFunc Factory
-	closing     bool
+	closing     atomic.Bool // Changed from bool to atomic.Bool for lock-free access
 	logger      *os.File
 }
 
@@ -64,6 +64,8 @@ func NewPool(poolCap uint32, f Factory, addr string) Pool {
 		factoryFunc: f,
 		logger:      os.Stderr,
 	}
+	// Initialize atomic fields explicitly
+	p.closing.Store(false)
 
 	return p
 }
@@ -91,13 +93,11 @@ func (p *pool) validateConnection(item PoolItem) bool {
 
 // Get retrieves an item from the pool.
 func (p *pool) Get() (PoolItem, error) {
-	p.mu.Lock()
-	if p.closing {
-		p.mu.Unlock()
+	if p.closing.Load() {
 		return nil, ErrClosing
 	}
-	p.mu.Unlock()
 
+	// Try to get an existing connection from the queue
 	select {
 	case item := <-p.queue:
 		if item == nil {
@@ -112,12 +112,14 @@ func (p *pool) Get() (PoolItem, error) {
 	default:
 	}
 
+	// Try to create a new connection if under capacity
 	current := p.count.Load()
 	if current < p.capacity {
 		if p.count.CompareAndSwap(current, current+1) {
 			item, err := p.factoryFunc(p.addr)
 			if err != nil {
 				p.count.Add(^uint32(0))
+
 				return nil, err
 			}
 
@@ -125,55 +127,50 @@ func (p *pool) Get() (PoolItem, error) {
 		}
 	}
 
-	for {
-		item := <-p.queue
-		if item == nil {
-			return nil, ErrClosing
-		}
-
-		if p.validateConnection(item) {
-			return item, nil
-		}
-
-		p.Release(item)
+	// Wait for a connection to become available
+	item := <-p.queue
+	if item == nil {
+		return nil, ErrClosing
 	}
+
+	if p.validateConnection(item) {
+		return item, nil
+	}
+
+	p.Release(item)
+
+	return p.Get() // Recursively try again if connection is invalid
 }
 
 // GetWithContext retrieves an item with context awareness.
 func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
-	p.mu.Lock()
-	if p.closing {
-		p.mu.Unlock()
+	if p.closing.Load() {
 		return nil, ErrClosing
 	}
-	p.mu.Unlock()
 
+	// Fast path: try to get an existing connection
 	select {
 	case item := <-p.queue:
 		if item == nil {
 			return nil, ErrClosing
 		}
-
 		if p.validateConnection(item) {
 			return item, nil
 		}
-
 		p.Release(item)
-	default:
-	}
-
-	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
 
+	// Try to create a new connection if under capacity
 	current := p.count.Load()
 	if current < p.capacity {
 		if p.count.CompareAndSwap(current, current+1) {
 			item, err := p.factoryFunc(p.addr)
 			if err != nil {
 				p.count.Add(^uint32(0))
+
 				return nil, err
 			}
 
@@ -181,20 +178,19 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 		}
 	}
 
+	// Wait for an available connection or context cancellation
 	for {
 		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
 		case item := <-p.queue:
 			if item == nil {
 				return nil, ErrClosing
 			}
-
 			if p.validateConnection(item) {
 				return item, nil
 			}
-
 			p.Release(item)
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 }
@@ -205,24 +201,21 @@ func (p *pool) Put(item PoolItem) {
 		return
 	}
 
-	p.mu.Lock()
-	if p.closing {
-		p.mu.Unlock()
+	if p.closing.Load() {
 		p.Release(item)
+
 		return
 	}
 
 	if !p.validateConnection(item) {
-		p.mu.Unlock()
 		p.Release(item)
+
 		return
 	}
 
 	select {
 	case p.queue <- item:
-		p.mu.Unlock()
 	default:
-		p.mu.Unlock()
 		p.Release(item)
 	}
 }
@@ -243,20 +236,31 @@ func (p *pool) Release(item PoolItem) {
 
 // Close closes the pool and all its items.
 func (p *pool) Close() {
-	p.mu.Lock()
-	if p.closing {
-		p.mu.Unlock()
+	// Fast check to avoid lock if already closing
+	if p.closing.Load() {
 		return
 	}
-	p.closing = true
+
+	p.mu.Lock()
+	// Double check after acquiring lock
+	if p.closing.Load() {
+		p.mu.Unlock()
+
+		return
+	}
+	p.closing.Store(true)
 	close(p.queue)
 
+	// Collect items to close outside the lock
 	itemsToClose := make([]PoolItem, 0, cap(p.queue))
 	for item := range p.queue {
-		itemsToClose = append(itemsToClose, item)
+		if item != nil {
+			itemsToClose = append(itemsToClose, item)
+		}
 	}
 	p.mu.Unlock()
 
+	// Release items outside the lock
 	for _, item := range itemsToClose {
 		p.Release(item)
 	}
