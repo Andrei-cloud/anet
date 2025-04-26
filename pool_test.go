@@ -44,7 +44,6 @@ func TestPool(t *testing.T) {
 
 	t.Run("NewPool", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-
 		p := anet.NewPool(1, factory, addr)
 		require.NotNil(t, p)
 		defer p.Close()
@@ -52,7 +51,6 @@ func TestPool(t *testing.T) {
 
 	t.Run("Get Len Put", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-
 		p := anet.NewPool(1, factory, addr)
 		require.NotNil(t, p)
 		defer p.Close()
@@ -72,7 +70,6 @@ func TestPool(t *testing.T) {
 
 	t.Run("Get on closed", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-
 		p := anet.NewPool(1, factory, addr)
 		require.NotNil(t, p)
 		p.Close()
@@ -86,7 +83,6 @@ func TestPool(t *testing.T) {
 
 	t.Run("GetWithContext", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-
 		p := anet.NewPool(1, factory, addr)
 		require.NotNil(t, p)
 		defer p.Close()
@@ -109,7 +105,6 @@ func TestPool(t *testing.T) {
 
 	t.Run("Release", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-
 		p := anet.NewPool(1, factory, addr)
 		require.NotNil(t, p)
 		defer p.Close()
@@ -128,7 +123,6 @@ func TestPool(t *testing.T) {
 
 	t.Run("Cap", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-
 		p := anet.NewPool(5, factory, addr)
 		require.NotNil(t, p)
 		defer p.Close()
@@ -171,7 +165,6 @@ func TestPool(t *testing.T) {
 
 	t.Run("Put on closed", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-
 		p := anet.NewPool(1, factory, addr)
 		require.NotNil(t, p)
 
@@ -191,7 +184,6 @@ func TestPool(t *testing.T) {
 
 	t.Run("Release nil", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-
 		p := anet.NewPool(1, factory, addr)
 		require.NotNil(t, p)
 		defer p.Close()

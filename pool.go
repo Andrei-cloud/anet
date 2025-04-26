@@ -3,7 +3,7 @@ package anet
 import (
 	"context"
 	"errors"
-	"log"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -41,7 +41,7 @@ type pool struct {
 	queue       chan PoolItem
 	factoryFunc Factory
 	closing     bool
-	logger      *log.Logger
+	logger      *os.File
 }
 
 // NewPoolList creates a list of Pool interfaces.
@@ -58,13 +58,15 @@ func NewPoolList(poolCap uint32, f Factory, addrs []string) []Pool {
 
 // NewPool creates a new connection pool. Returns the Pool interface.
 func NewPool(poolCap uint32, f Factory, addr string) Pool {
-	return &pool{
+	p := &pool{
 		addr:        addr,
 		capacity:    poolCap,
 		queue:       make(chan PoolItem, poolCap),
 		factoryFunc: f,
-		logger:      log.New(os.Stderr, "pool: ", log.LstdFlags),
+		logger:      os.Stderr,
 	}
+
+	return p
 }
 
 // validateConnection performs basic connection check.
@@ -83,7 +85,6 @@ func (p *pool) validateConnection(item PoolItem) bool {
 		// Enable keep-alive to detect stale connections.
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			if err := tcpConn.SetKeepAlive(true); err != nil {
-				p.logger.Printf("Failed to enable keep-alive: %v.", err)
 				return false
 			}
 		}
@@ -97,7 +98,6 @@ func (p *pool) Get() (PoolItem, error) {
 	p.mu.Lock()
 	if p.closing {
 		p.mu.Unlock()
-
 		return nil, ErrClosing
 	}
 	p.mu.Unlock()
@@ -124,7 +124,6 @@ func (p *pool) Get() (PoolItem, error) {
 			item, err := p.factoryFunc(p.addr)
 			if err != nil {
 				p.count.Add(^uint32(0))
-
 				return nil, err
 			}
 
@@ -152,7 +151,6 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 	p.mu.Lock()
 	if p.closing {
 		p.mu.Unlock()
-
 		return nil, ErrClosing
 	}
 	p.mu.Unlock()
@@ -186,7 +184,6 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 			item, err := p.factoryFunc(p.addr)
 			if err != nil {
 				p.count.Add(^uint32(0))
-
 				return nil, err
 			}
 
@@ -223,7 +220,6 @@ func (p *pool) Put(item PoolItem) {
 	if p.closing {
 		p.mu.Unlock()
 		p.Release(item)
-
 		return
 	}
 
@@ -231,7 +227,6 @@ func (p *pool) Put(item PoolItem) {
 	if !p.validateConnection(item) {
 		p.mu.Unlock()
 		p.Release(item)
-
 		return
 	}
 
@@ -250,8 +245,12 @@ func (p *pool) Release(item PoolItem) {
 	if item != nil {
 		p.count.Add(^uint32(0))
 		if err := item.Close(); err != nil {
+			// Write error to logger if not nil
 			if p.logger != nil {
-				p.logger.Printf("Error closing pool item: %v.", err)
+				if _, err := fmt.Fprintf(p.logger, "Error closing pool item: %v\n", err); err != nil {
+					// If we can't write to logger, write to stderr as last resort
+					_, _ = fmt.Fprintf(os.Stderr, "Error writing to logger: %v\n", err)
+				}
 			}
 		}
 	}

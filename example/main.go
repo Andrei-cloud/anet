@@ -161,7 +161,7 @@ func main() {
 	logger := &loggerWrapper{
 		Logger: log.New(os.Stdout, "BROKER: ", log.LstdFlags|log.Lmicroseconds),
 	}
-	broker := anet.NewBroker(pools, numWorkers, logger) // Pass wrapped logger.
+	broker := anet.NewBroker(pools, numWorkers, logger)
 
 	// Start broker workers in background.
 	go func() {
