@@ -1,7 +1,6 @@
 package anet
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -25,23 +24,26 @@ func Write(w io.Writer, in []byte) error {
 		return ErrMaxLenExceeded
 	}
 
-	out := &bytes.Buffer{}
+	// Get a buffer from the pool for the header
+	headerBuf := globalBufferPool.getBuffer(LENGTHSIZE)
+	defer globalBufferPool.putBuffer(headerBuf)
+
 	switch LENGTHSIZE {
 	case 2:
-		if err := binary.Write(out, binary.BigEndian, uint16(len(in))); err != nil {
-			return err
-		}
+		binary.BigEndian.PutUint16(headerBuf, uint16(len(in)))
 	case 4:
-		if err := binary.Write(out, binary.BigEndian, uint32(len(in))); err != nil {
-			return err
-		}
+		binary.BigEndian.PutUint32(headerBuf, uint32(len(in)))
 	default:
 		return fmt.Errorf("unsupported header size: %d", LENGTHSIZE)
 	}
-	if _, err := out.Write(in); err != nil {
+
+	// Write the header
+	if _, err := w.Write(headerBuf[:LENGTHSIZE]); err != nil {
 		return err
 	}
-	if _, err := out.WriteTo(w); err != nil {
+
+	// Write the payload
+	if _, err := w.Write(in); err != nil {
 		return err
 	}
 
@@ -50,41 +52,36 @@ func Write(w io.Writer, in []byte) error {
 
 // Read reads data prefixed with a big-endian length header.
 func Read(r io.Reader) ([]byte, error) {
+	// Get a buffer from the pool for the header
+	headerBuf := globalBufferPool.getBuffer(LENGTHSIZE)
+	defer globalBufferPool.putBuffer(headerBuf)
+
+	if _, err := io.ReadFull(r, headerBuf[:LENGTHSIZE]); err != nil {
+		return nil, err
+	}
+
 	var length uint64
 	switch LENGTHSIZE {
 	case 2:
-		var l2 uint16
-		if err := binary.Read(r, binary.BigEndian, &l2); err != nil {
-			return nil, err
-		}
-		length = uint64(l2)
+		length = uint64(binary.BigEndian.Uint16(headerBuf))
 	case 4:
-		var l4 uint32
-		if err := binary.Read(r, binary.BigEndian, &l4); err != nil {
-			return nil, err
-		}
-		length = uint64(l4)
+		length = uint64(binary.BigEndian.Uint32(headerBuf))
 	default:
 		return nil, fmt.Errorf("unsupported header size: %d", LENGTHSIZE)
 	}
 
-	message := make([]byte, int(length))
-	if _, err := io.ReadFull(r, message); err != nil {
+	// Get a buffer from the pool for the message
+	message := globalBufferPool.getBuffer(int(length))
+	defer globalBufferPool.putBuffer(message)
+
+	if _, err := io.ReadFull(r, message[:length]); err != nil {
 		return nil, err
 	}
 
-	if len(message) > LENGTHSIZE {
-		var innerLen uint64
-		switch LENGTHSIZE {
-		case 2:
-			innerLen = uint64(binary.BigEndian.Uint16(message[:2]))
-		case 4:
-			innerLen = uint64(binary.BigEndian.Uint32(message[:4]))
-		}
-		if innerLen == uint64(len(message)-LENGTHSIZE) {
-			message = message[LENGTHSIZE:]
-		}
-	}
+	// Create a new buffer with just the needed size for the result
+	// Note: We have to copy here as the pooled buffer will be reused
+	result := make([]byte, length)
+	copy(result, message[:length])
 
-	return message, nil
+	return result, nil
 }
