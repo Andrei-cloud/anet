@@ -24,9 +24,6 @@ var (
 	// ErrClosingBroker indicates the broker is in the process of closing.
 	ErrClosingBroker = errors.New("broker is closing")
 
-	// ErrMaxLenExceeded indicates a message exceeds the maximum allowed length.
-	ErrMaxLenExceeded = errors.New("max length exceeded")
-
 	// ErrNoPoolsAvailable indicates no connection pools are available.
 	ErrNoPoolsAvailable = errors.New("no connection pools available")
 )
@@ -163,8 +160,14 @@ func (b *broker) Close() {
 	closedCount := 0 // Count closed connections for debugging.
 	b.activeConns.Range(func(key, value any) bool {
 		if conn, ok := value.(net.Conn); ok {
-			b.logger.Debugf("Closing active connection for task %s", key.(string)) // Add debug log.
-			_ = conn.Close()
+			b.logger.Debugf("Closing active connection for task %s", key.(string))
+			if err := conn.Close(); err != nil {
+				b.logger.Warnf(
+					"Error closing connection for task %s: %v",
+					key.(string),
+					err,
+				)
+			}
 			closedCount++
 		}
 		b.activeConns.Delete(key)
@@ -842,7 +845,7 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 			connInfo,
 			err,
 		) // Add debug log.
-		// return fmt.Errorf("clearing deadline: %w", err) // Decided not to return error here.
+		// Decided not to return error here.
 	}
 
 	b.logger.Debugf(
