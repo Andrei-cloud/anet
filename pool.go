@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net"
 	"os"
 	"sync"
 	"sync/atomic"
 )
 
+// ErrClosing indicates the pool is shutting down.
 var ErrClosing = errors.New("pool is closing")
 
+// Pool manages a collection of reusable connections.
 type Pool interface {
 	Get() (PoolItem, error)
 	GetWithContext(context.Context) (PoolItem, error)
@@ -21,17 +24,20 @@ type Pool interface {
 	Close()
 }
 
+// PoolItem represents a closeable resource managed by the pool.
 type PoolItem interface {
 	Close() error
 }
 
+// Factory creates new pool items.
 type Factory func(string) (PoolItem, error)
 
+// pool implements the Pool interface.
 type pool struct {
 	mu          sync.Mutex
 	addr        string
 	capacity    uint32
-	count       atomic.Uint32 // Change to atomic.Uint32 for better sync
+	count       atomic.Uint32
 	queue       chan PoolItem
 	factoryFunc Factory
 	closing     bool
@@ -61,23 +67,64 @@ func NewPool(poolCap uint32, f Factory, addr string) Pool {
 	}
 }
 
+// validateConnection performs basic connection check.
+func (p *pool) validateConnection(item PoolItem) bool {
+	if item == nil {
+		return false
+	}
+
+	// Check if connection is alive.
+	if conn, ok := item.(net.Conn); ok {
+		// Simply check if connection is nil or closed.
+		if conn == nil {
+			return false
+		}
+
+		// Enable keep-alive to detect stale connections.
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			if err := tcpConn.SetKeepAlive(true); err != nil {
+				p.logger.Printf("Failed to enable keep-alive: %v.", err)
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
 // Get retrieves an item from the pool.
 func (p *pool) Get() (PoolItem, error) {
-	// Check closing state
 	p.mu.Lock()
 	if p.closing {
 		p.mu.Unlock()
+
 		return nil, ErrClosing
 	}
 	p.mu.Unlock()
 
-	// Grow pool if under capacity
+	// Try to reuse idle connections.
+	select {
+	case item := <-p.queue:
+		if item == nil {
+			return nil, ErrClosing
+		}
+
+		if p.validateConnection(item) {
+			return item, nil
+		}
+
+		p.Release(item)
+	default:
+	}
+
+	// Grow pool if under capacity.
 	current := p.count.Load()
 	if current < p.capacity {
 		if p.count.CompareAndSwap(current, current+1) {
 			item, err := p.factoryFunc(p.addr)
 			if err != nil {
 				p.count.Add(^uint32(0))
+
 				return nil, err
 			}
 
@@ -85,50 +132,61 @@ func (p *pool) Get() (PoolItem, error) {
 		}
 	}
 
-	// Try non-blocking queue read
-	select {
-	case item := <-p.queue:
+	// Block until an item is available.
+	for {
+		item := <-p.queue
 		if item == nil {
 			return nil, ErrClosing
 		}
 
-		return item, nil
-	default:
-	}
+		if p.validateConnection(item) {
+			return item, nil
+		}
 
-	// Block until an item is available
-	item := <-p.queue
-	if item == nil {
-		return nil, ErrClosing
+		p.Release(item)
 	}
-
-	return item, nil
 }
 
 // GetWithContext retrieves an item from the pool with context awareness.
 func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
-	// Check closing state
 	p.mu.Lock()
 	if p.closing {
 		p.mu.Unlock()
+
 		return nil, ErrClosing
 	}
 	p.mu.Unlock()
 
-	// Context cancellation before attempting grow
+	// Try to reuse idle connections.
+	select {
+	case item := <-p.queue:
+		if item == nil {
+			return nil, ErrClosing
+		}
+
+		if p.validateConnection(item) {
+			return item, nil
+		}
+
+		p.Release(item)
+	default:
+	}
+
+	// Check context before growing pool.
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
 	}
 
-	// Grow pool if under capacity
+	// Grow pool if under capacity.
 	current := p.count.Load()
 	if current < p.capacity {
 		if p.count.CompareAndSwap(current, current+1) {
 			item, err := p.factoryFunc(p.addr)
 			if err != nil {
 				p.count.Add(^uint32(0))
+
 				return nil, err
 			}
 
@@ -136,53 +194,53 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 		}
 	}
 
-	// Try non-blocking queue read or check context
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case item := <-p.queue:
-		if item == nil {
-			return nil, ErrClosing
+	// Block until item available or context done.
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case item := <-p.queue:
+			if item == nil {
+				return nil, ErrClosing
+			}
+
+			if p.validateConnection(item) {
+				return item, nil
+			}
+
+			p.Release(item)
 		}
-
-		return item, nil
-	default:
-	}
-
-	// Block until an item is available or context done
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case item := <-p.queue:
-		if item == nil {
-			return nil, ErrClosing
-		}
-
-		return item, nil
 	}
 }
 
 // Put returns an item to the pool.
 func (p *pool) Put(item PoolItem) {
-	if item == nil { // Prevent putting nil items back
+	if item == nil {
 		return
 	}
 
 	p.mu.Lock()
 	if p.closing {
-		p.mu.Unlock() // Unlock before potentially blocking Release->item.Close()
+		p.mu.Unlock()
 		p.Release(item)
+
 		return
 	}
 
-	// Try a non-blocking send. If the queue is full, release the item.
+	// Validate connection before returning to pool.
+	if !p.validateConnection(item) {
+		p.mu.Unlock()
+		p.Release(item)
+
+		return
+	}
+
+	// Try non-blocking put or release.
 	select {
 	case p.queue <- item:
-		// Item successfully put back into the queue
 		p.mu.Unlock()
 	default:
-		// Queue is full, release the item instead of blocking
-		p.mu.Unlock() // Unlock before potentially blocking Release->item.Close()
+		p.mu.Unlock()
 		p.Release(item)
 	}
 }
@@ -190,12 +248,10 @@ func (p *pool) Put(item PoolItem) {
 // Release closes an item and decrements the pool count.
 func (p *pool) Release(item PoolItem) {
 	if item != nil {
-		// Decrement count using atomic operations
 		p.count.Add(^uint32(0))
 		if err := item.Close(); err != nil {
-			// Log error only if logger is configured
 			if p.logger != nil {
-				p.logger.Printf("Error closing pool item: %v", err)
+				p.logger.Printf("Error closing pool item: %v.", err)
 			}
 		}
 	}
@@ -205,22 +261,20 @@ func (p *pool) Release(item PoolItem) {
 func (p *pool) Close() {
 	p.mu.Lock()
 	if p.closing {
-		p.mu.Unlock() // Already closing, release lock and return
+		p.mu.Unlock()
 		return
 	}
 	p.closing = true
-	close(p.queue) // Close the channel to signal waiters
+	close(p.queue)
 
-	itemsToClose := make([]PoolItem, 0, cap(p.queue)) // Use cap instead of len
-	// Drain the queue into a temporary slice while lock is held
+	itemsToClose := make([]PoolItem, 0, cap(p.queue))
 	for item := range p.queue {
 		itemsToClose = append(itemsToClose, item)
 	}
-	p.mu.Unlock() // Release the lock *before* closing items
+	p.mu.Unlock()
 
-	// Now close the items without holding the pool lock
 	for _, item := range itemsToClose {
-		p.Release(item) // Release will decrement count and call item.Close()
+		p.Release(item)
 	}
 }
 

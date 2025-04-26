@@ -34,34 +34,33 @@ func waitGroupWithTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
 // Returns the server address, a stop function, and any error.
 func StartTestServer() (string, func() error, error) {
 	quit := make(chan struct{})
-	ready := make(chan struct{}) // Signal channel to indicate server is ready
-	// Listen on IPv4 loopback to ensure clients connect via 127.0.0.1
+	ready := make(chan struct{})
+
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return "", nil, err
 	}
 
-	// Track active connections for clean shutdown
+	// Track active connections for clean shutdown.
 	var activeConnections sync.WaitGroup
-	shutdownTimeout := 3 * time.Second // Configurable shutdown timeout
+	shutdownTimeout := 5 * time.Second
 
-	// Create a mutex to protect the listener during close
+	// Create a mutex to protect the listener during close.
 	var listenerMu sync.Mutex
-	listenerClosed := false
+	var listenerClosed bool
 
 	go func() {
-		// Signal that the server is ready to accept connections
+		// Signal that the server is ready to accept connections.
 		close(ready)
 
 		for {
-			// Use a timeout on Accept to avoid blocking forever on shutdown
+			// Use a timeout on Accept to avoid blocking forever on shutdown.
 			listenerMu.Lock()
 			if listenerClosed {
 				listenerMu.Unlock()
 				return
 			}
 			if tcpListener, ok := l.(*net.TCPListener); ok {
-				// Set a shorter deadline to make shutdown more responsive
 				_ = tcpListener.SetDeadline(time.Now().Add(500 * time.Millisecond))
 			}
 			listenerMu.Unlock()
@@ -72,53 +71,78 @@ func StartTestServer() (string, func() error, error) {
 			default:
 				conn, err := l.Accept()
 				if err != nil {
-					// Check if the error is due to the listener being closed or timeout
 					if errors.Is(err, net.ErrClosed) {
 						log.Printf("Test server listener closed.")
-						return // Exit goroutine when listener is closed
+						return
 					} else if os.IsTimeout(err) {
-						// This is just a timeout from our SetDeadline, continue accepting
 						continue
 					}
-
 					log.Printf("Test server accept error: %v", err)
-					continue // Continue accepting other connections
+					continue
 				}
-				// Handle one echo request per connection using anet framing
+
 				activeConnections.Add(1)
 				go func(conn net.Conn) {
 					defer func() {
-						_ = conn.Close() // Ignore close error in defer
+						_ = conn.Close()
 						activeConnections.Done()
 					}()
 
-					// Set read deadline to prevent goroutines from hanging forever
-					if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-						log.Printf("Test server set read deadline error: %v", err)
-						return
+					// Configure TCP keepalive.
+					if tcpConn, ok := conn.(*net.TCPConn); ok {
+						_ = tcpConn.SetKeepAlive(true)
+						_ = tcpConn.SetKeepAlivePeriod(2 * time.Second)
 					}
 
-					// Read the incoming message (includes TaskID)
-					requestMsg, err := anet.Read(conn)
-					if err != nil {
-						if err != io.EOF && !errors.Is(err, net.ErrClosed) {
-							log.Printf("Test server read error: %v", err)
+					for {
+						// Reset read deadline for each message.
+						if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+							if !errors.Is(err, net.ErrClosed) {
+								log.Printf("Test server set read deadline error: %v", err)
+							}
+							return
 						}
-						return
-					}
 
-					// Set write deadline to prevent hanging
-					if err := conn.SetWriteDeadline(time.Now().Add(1 * time.Second)); err != nil {
-						log.Printf("Test server set write deadline error: %v", err)
-						return
-					}
+						// Read the incoming message.
+						requestMsg, err := anet.Read(conn)
+						if err != nil {
+							if err != io.EOF && !errors.Is(err, net.ErrClosed) {
+								log.Printf("Test server read error: %v", err)
+							}
+							return
+						}
 
-					// Simulate processing: Echo the message back (preserving TaskID)
-					// anet.Write will add the length prefix automatically.
-					err = anet.Write(conn, requestMsg)
-					if err != nil {
-						if !errors.Is(err, net.ErrClosed) {
-							log.Printf("Test server write error: %v", err)
+						// Reset write deadline for response.
+						if err := conn.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+							if !errors.Is(err, net.ErrClosed) {
+								log.Printf("Test server set write deadline error: %v", err)
+							}
+							return
+						}
+
+						// Echo the message back.
+						err = anet.Write(conn, requestMsg)
+						if err != nil {
+							if !errors.Is(err, net.ErrClosed) {
+								log.Printf("Test server write error: %v", err)
+							}
+							return
+						}
+
+						// Clear deadlines after response.
+						if err := conn.SetDeadline(time.Time{}); err != nil {
+							if !errors.Is(err, net.ErrClosed) {
+								log.Printf("Test server clear deadline error: %v", err)
+							}
+							return
+						}
+
+						// Check if server is shutting down.
+						select {
+						case <-quit:
+							return
+						default:
+							continue
 						}
 					}
 				}(conn)
@@ -126,24 +150,24 @@ func StartTestServer() (string, func() error, error) {
 		}
 	}()
 
-	// Wait for server to be ready
+	// Wait for server to be ready.
 	<-ready
 
 	return l.Addr().String(), func() error {
-		// Signal all accept loops to quit
+		// Signal all accept loops to quit.
 		close(quit)
 
-		// Close the listener with proper mutex protection
+		// Close the listener with proper mutex protection.
 		listenerMu.Lock()
 		listenerClosed = true
 		err := l.Close()
 		listenerMu.Unlock()
 
-		// Wait for all active connections to complete (with timeout)
+		// Wait for all active connections to complete.
 		if !waitGroupWithTimeout(&activeConnections, shutdownTimeout) {
 			log.Printf("Timed out waiting for test server connections to close")
 		}
 
 		return err
-	}, err
+	}, nil
 }
