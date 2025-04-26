@@ -63,7 +63,7 @@ func NewPool(poolCap uint32, f Factory, addr string) Pool {
 
 // Get retrieves an item from the pool.
 func (p *pool) Get() (PoolItem, error) {
-	// Check closing state with mutex to avoid race
+	// Check closing state
 	p.mu.Lock()
 	if p.closing {
 		p.mu.Unlock()
@@ -71,50 +71,41 @@ func (p *pool) Get() (PoolItem, error) {
 	}
 	p.mu.Unlock()
 
-	select {
-	// Try non-blocking read first
-	case item := <-p.queue:
-		if item == nil { // Channel closed while waiting
-			return nil, ErrClosing
-		}
-
-		return item, nil
-	default:
-		// Queue is empty or temporarily blocked, proceed to check capacity
-	}
-
-	// Atomically check and increment count if under capacity
-	currentCount := p.count.Load()
-	if currentCount < p.capacity {
-		// Try to atomically increment the counter
-		if p.count.CompareAndSwap(currentCount, currentCount+1) {
-			// Successfully incremented the counter, create a new item
+	// Grow pool if under capacity
+	current := p.count.Load()
+	if current < p.capacity {
+		if p.count.CompareAndSwap(current, current+1) {
 			item, err := p.factoryFunc(p.addr)
 			if err != nil {
-				// Decrement count on error
 				p.count.Add(^uint32(0))
-
 				return nil, err
 			}
 
 			return item, nil
 		}
-		// CompareAndSwap failed, someone else modified the counter
-		// Fall through to blocking wait
 	}
 
-	// Capacity reached or CompareAndSwap failed, must wait for an item
+	// Try non-blocking queue read
+	select {
+	case item := <-p.queue:
+		if item == nil {
+			return nil, ErrClosing
+		}
+		return item, nil
+	default:
+	}
+
+	// Block until an item is available
 	item := <-p.queue
-	if item == nil { // Check if channel was closed while waiting
+	if item == nil {
 		return nil, ErrClosing
 	}
-
 	return item, nil
 }
 
 // GetWithContext retrieves an item from the pool with context awareness.
 func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
-	// Check closing state with mutex to avoid race
+	// Check closing state
 	p.mu.Lock()
 	if p.closing {
 		p.mu.Unlock()
@@ -122,49 +113,47 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 	}
 	p.mu.Unlock()
 
+	// Context cancellation before attempting grow
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	// Try non-blocking read first
-	case item := <-p.queue:
-		if item == nil { // Channel closed
-			return nil, ErrClosing
-		}
-
-		return item, nil
 	default:
-		// Queue is empty or temporarily blocked
 	}
 
-	// Atomically check and increment count if under capacity
-	currentCount := p.count.Load()
-	if currentCount < p.capacity {
-		// Try to atomically increment the counter
-		if p.count.CompareAndSwap(currentCount, currentCount+1) {
-			// Successfully incremented the counter, create a new item
+	// Grow pool if under capacity
+	current := p.count.Load()
+	if current < p.capacity {
+		if p.count.CompareAndSwap(current, current+1) {
 			item, err := p.factoryFunc(p.addr)
 			if err != nil {
-				// Decrement count on error
 				p.count.Add(^uint32(0))
-
 				return nil, err
 			}
 
 			return item, nil
 		}
-		// CompareAndSwap failed, someone else modified the counter
-		// Fall through to blocking wait
 	}
 
-	// Blocking wait with context awareness
+	// Try non-blocking queue read or check context
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case item := <-p.queue:
-		if item == nil { // Check if channel was closed while waiting
+		if item == nil {
 			return nil, ErrClosing
 		}
+		return item, nil
+	default:
+	}
 
+	// Block until an item is available or context done
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case item := <-p.queue:
+		if item == nil {
+			return nil, ErrClosing
+		}
 		return item, nil
 	}
 }
