@@ -43,6 +43,7 @@ type broker struct {
 	compool      []Pool
 	requestQueue chan *Task
 	pending      sync.Map
+	activeConns  sync.Map // map[string]net.Conn
 	//nolint:containedctx // Necessary for task cancellation within the broker queue.
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -115,6 +116,16 @@ func (b *broker) Close() {
 	b.closing.Store(true)
 	b.cancel() // signal loop via context cancel
 	b.mu.Unlock()
+
+	// Close all active connections to unblock any Read/Write in workers
+	b.activeConns.Range(func(key, value any) bool {
+		if conn, ok := value.(net.Conn); ok {
+			_ = conn.Close()
+		}
+		b.activeConns.Delete(key)
+
+		return true
+	})
 
 	// Wait for all workers to finish processing their current task (if any)
 	b.wg.Wait()
@@ -356,6 +367,9 @@ func (b *broker) loop(workerID int) error {
 				continue
 			}
 
+			// Store active connection for shutdown
+			b.activeConns.Store(string(task.taskID), netConn)
+
 			cmd = b.addTask(task)
 
 			err = Write(netConn, cmd)
@@ -388,11 +402,24 @@ func (b *broker) loop(workerID int) error {
 					hex.EncodeToString(task.taskID),
 				)
 			}
+
+			// Remove active connection after task completion
+			b.activeConns.Delete(string(task.taskID))
 		}
 	}
 }
 
 func (b *broker) trySendError(task *Task, err error) {
+	// Safely attempt to send error to task, recovering if channel is closed.
+	defer func() {
+		if r := recover(); r != nil {
+			b.logger.Printf(
+				"Recovered panic sending error for task %s: %v",
+				hex.EncodeToString(task.taskID),
+				r,
+			)
+		}
+	}()
 	select {
 	case task.errCh <- err:
 	default:
