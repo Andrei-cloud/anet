@@ -1,3 +1,4 @@
+// Package anet provides network communication components.
 package anet
 
 import (
@@ -5,17 +6,21 @@ import (
 )
 
 // maxBufferSize is the maximum size of buffers that will be pooled.
+// Larger buffers will be allocated but not pooled to prevent memory bloat.
 const maxBufferSize = 64 * 1024 // 64KB
 
-// bufferPool is a pool of byte slices for reuse.
+// bufferPool manages a set of sync.Pool instances for different buffer sizes.
+// This helps reduce memory allocations and GC pressure by reusing buffers.
 type bufferPool struct {
-	pools []*sync.Pool
+	pools []*sync.Pool // Array of pools for different size classes
 }
 
-// Global buffer pool instance.
+// Global buffer pool instance used by the message framing utilities.
 var globalBufferPool = newBufferPool()
 
-// newBufferPool creates a new buffer pool.
+// newBufferPool creates a new buffer pool with pre-allocated sync.Pool instances
+// for common buffer sizes. This improves performance by reducing allocations
+// for frequently used message sizes.
 func newBufferPool() *bufferPool {
 	bp := &bufferPool{
 		pools: make([]*sync.Pool, 32), // Pool sizes from 32B to 64KB
@@ -37,6 +42,8 @@ func newBufferPool() *bufferPool {
 }
 
 // getBuffer retrieves a buffer from the pool that is at least size bytes.
+// If no suitable buffer exists in the pool, a new one will be allocated.
+// The returned buffer may be larger than requested but will be at least size bytes.
 func (bp *bufferPool) getBuffer(size int) []byte {
 	if size > maxBufferSize {
 		return make([]byte, size)
@@ -53,7 +60,9 @@ func (bp *bufferPool) getBuffer(size int) []byte {
 	return bp.pools[poolIdx].Get().([]byte)
 }
 
-// putBuffer returns a buffer to the pool.
+// putBuffer returns a buffer to the pool for future reuse.
+// Buffers larger than maxBufferSize are not pooled to prevent memory bloat.
+// The buffer should not be accessed after being returned to the pool.
 func (bp *bufferPool) putBuffer(buf []byte) {
 	if len(buf) > maxBufferSize {
 		return // Don't pool large buffers

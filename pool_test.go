@@ -44,14 +44,14 @@ func TestPool(t *testing.T) {
 
 	t.Run("NewPool", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-		p := anet.NewPool(1, factory, addr)
+		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
 		defer p.Close()
 	})
 
 	t.Run("Get Len Put", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-		p := anet.NewPool(1, factory, addr)
+		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
 		defer p.Close()
 
@@ -70,7 +70,7 @@ func TestPool(t *testing.T) {
 
 	t.Run("Get on closed", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-		p := anet.NewPool(1, factory, addr)
+		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
 		p.Close()
 
@@ -83,7 +83,7 @@ func TestPool(t *testing.T) {
 
 	t.Run("GetWithContext", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-		p := anet.NewPool(1, factory, addr)
+		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
 		defer p.Close()
 
@@ -105,7 +105,7 @@ func TestPool(t *testing.T) {
 
 	t.Run("Release", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-		p := anet.NewPool(1, factory, addr)
+		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
 		defer p.Close()
 
@@ -123,7 +123,7 @@ func TestPool(t *testing.T) {
 
 	t.Run("Cap", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-		p := anet.NewPool(5, factory, addr)
+		p := anet.NewPool(5, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
 		defer p.Close()
 		require.Equal(t, 5, p.Cap())
@@ -135,7 +135,7 @@ func TestPool(t *testing.T) {
 		errorFactory := func(_ string) (anet.PoolItem, error) {
 			return nil, errors.New("factory error")
 		}
-		p := anet.NewPool(1, errorFactory, addr)
+		p := anet.NewPool(1, errorFactory, addr, nil) // Use default config
 		require.NotNil(t, p)
 		defer p.Close()
 
@@ -151,7 +151,7 @@ func TestPool(t *testing.T) {
 		errorFactory := func(_ string) (anet.PoolItem, error) {
 			return nil, errors.New("factory error ctx")
 		}
-		p := anet.NewPool(1, errorFactory, addr)
+		p := anet.NewPool(1, errorFactory, addr, nil) // Use default config
 		require.NotNil(t, p)
 		defer p.Close()
 
@@ -165,7 +165,7 @@ func TestPool(t *testing.T) {
 
 	t.Run("Put on closed", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-		p := anet.NewPool(1, factory, addr)
+		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
 
 		item, err := p.Get()
@@ -184,7 +184,7 @@ func TestPool(t *testing.T) {
 
 	t.Run("Release nil", func(t *testing.T) {
 		// sequential subtest, no t.Parallel()
-		p := anet.NewPool(1, factory, addr)
+		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
 		defer p.Close()
 		p.Release(nil)
@@ -195,7 +195,7 @@ func TestPool(t *testing.T) {
 		// sequential subtest, no t.Parallel()
 
 		addrs := []string{addr, addr}
-		pools := anet.NewPoolList(2, factory, addrs)
+		pools := anet.NewPoolList(2, factory, addrs, nil) // Use default config
 		require.Len(t, pools, 2)
 		for _, p := range pools {
 			require.NotNil(t, p)
@@ -208,8 +208,10 @@ func TestPool(t *testing.T) {
 		// sequential subtest, no t.Parallel()
 
 		// Create a pool with increased capacity for concurrent access
-		poolCapacity := uint32(20) // Increased capacity to handle concurrent load
-		p := anet.NewPool(poolCapacity, factory, addr)
+		poolCapacity := uint32(
+			20,
+		) // Increased capacity to handle concurrent load
+		p := anet.NewPool(poolCapacity, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
 		defer p.Close()
 
@@ -369,7 +371,7 @@ func BenchmarkPool(b *testing.B) {
 	}
 
 	for _, i := range worker_num {
-		p := anet.NewPool(1, factory, addr)
+		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(b, p)
 		b.Run(fmt.Sprintf("Workers %d", i), func(b *testing.B) {
 			benchmarkPool(p, b)

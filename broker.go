@@ -27,6 +27,25 @@ var (
 	ErrNoPoolsAvailable = errors.New("no connection pools available")
 )
 
+// BrokerConfig contains configuration options for a broker.
+type BrokerConfig struct {
+	// WriteTimeout is the timeout for writing to connections. Default is 5s.
+	WriteTimeout time.Duration
+	// ReadTimeout is the timeout for reading from connections. Default is 5s.
+	ReadTimeout time.Duration
+	// QueueSize is the size of the request queue. Default is 1000.
+	QueueSize int
+}
+
+// DefaultBrokerConfig returns the default broker configuration.
+func DefaultBrokerConfig() *BrokerConfig {
+	return &BrokerConfig{
+		WriteTimeout: 5 * time.Second,
+		ReadTimeout:  5 * time.Second,
+		QueueSize:    1000,
+	}
+}
+
 // Broker coordinates sending requests and receiving responses over pooled connections.
 type Broker interface {
 	Send(*[]byte) ([]byte, error)
@@ -61,6 +80,7 @@ type broker struct {
 	rng     *rand.Rand
 	wg      sync.WaitGroup
 	closing atomic.Bool
+	config  *BrokerConfig
 }
 
 // NoopLogger provides a default no-op logger.
@@ -73,9 +93,12 @@ func (l *NoopLogger) Warnf(_ string, _ ...any)  {}
 func (l *NoopLogger) Errorf(_ string, _ ...any) {}
 
 // NewBroker creates a new message broker.
-func NewBroker(p []Pool, n int, l Logger) Broker {
+func NewBroker(p []Pool, n int, l Logger, config *BrokerConfig) Broker {
 	if l == nil {
 		l = &NoopLogger{}
+	}
+	if config == nil {
+		config = DefaultBrokerConfig()
 	}
 	rngSource := rand.NewSource(time.Now().UnixNano())
 	rng := rand.New(rngSource)
@@ -85,11 +108,12 @@ func NewBroker(p []Pool, n int, l Logger) Broker {
 		workers:      n,
 		compool:      p,
 		recvQueue:    make(chan PoolItem, n),
-		requestQueue: make(chan *Task, n),
+		requestQueue: make(chan *Task, config.QueueSize),
 		ctx:          ctx,
 		cancel:       cancel,
 		logger:       l,
 		rng:          rng,
+		config:       config,
 	}
 }
 
@@ -337,7 +361,7 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 		return ErrClosingBroker
 	}
 
-	writeDeadline := time.Now().Add(5 * time.Second)
+	writeDeadline := time.Now().Add(b.config.WriteTimeout)
 	if err := netConn.SetWriteDeadline(writeDeadline); err != nil {
 		b.trySendError(task, fmt.Errorf("setting write deadline: %w", err))
 		return err
@@ -348,7 +372,7 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 		return err
 	}
 
-	readDeadline := time.Now().Add(5 * time.Second)
+	readDeadline := time.Now().Add(b.config.ReadTimeout)
 	if err := netConn.SetReadDeadline(readDeadline); err != nil {
 		b.trySendError(task, fmt.Errorf("setting read deadline: %w", err))
 		return err

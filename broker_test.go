@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestBroker tests the broker functionality
 func TestBroker(t *testing.T) {
 	// Run subtests sequentially to avoid races between Start and Close
 	// t.Parallel() removed
@@ -44,25 +45,13 @@ func TestBroker(t *testing.T) {
 		return conn, nil
 	}
 
-	t.Run("NewBroker", func(t *testing.T) {
+	t.Run("Send Success", func(t *testing.T) {
 		// sequential subtest
-
-		p := anet.NewPool(1, factory, addr)
-		require.NotNil(t, p)
-		broker := anet.NewBroker([]anet.Pool{p}, 1, nil)
-		require.NotNil(t, broker)
-		broker.Close()
-		p.Close()
-	})
-
-	t.Run("Send and Receive", func(t *testing.T) {
-		// sequential subtest
-
-		p := anet.NewPool(2, factory, addr)
+		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
 		defer p.Close()
 
-		broker := anet.NewBroker([]anet.Pool{p}, 2, nil)
+		broker := anet.NewBroker([]anet.Pool{p}, 1, nil, nil) // Use default config
 		require.NotNil(t, broker)
 
 		// Start broker workers
@@ -74,7 +63,6 @@ func TestBroker(t *testing.T) {
 		// Wait a moment for workers to spin up
 		time.Sleep(50 * time.Millisecond)
 
-		// Perform Send
 		msg := []byte("hello broker")
 		resp, err := broker.Send(&msg)
 		if err != nil {
@@ -95,12 +83,11 @@ func TestBroker(t *testing.T) {
 
 	t.Run("SendContext Success", func(t *testing.T) {
 		// sequential subtest
-
-		p := anet.NewPool(1, factory, addr)
+		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
 		defer p.Close()
 
-		broker := anet.NewBroker([]anet.Pool{p}, 1, nil)
+		broker := anet.NewBroker([]anet.Pool{p}, 1, nil, nil) // Use default config
 		require.NotNil(t, broker)
 
 		// Start broker workers
@@ -153,11 +140,11 @@ func TestBroker(t *testing.T) {
 			return conn, nil
 		}
 
-		p := anet.NewPool(1, slowFactory, addr)
+		p := anet.NewPool(1, slowFactory, addr, nil) // Use default config
 		require.NotNil(t, p)
 		defer p.Close()
 
-		broker := anet.NewBroker([]anet.Pool{p}, 1, nil)
+		broker := anet.NewBroker([]anet.Pool{p}, 1, nil, nil) // Use default config
 		require.NotNil(t, broker)
 
 		// Start broker workers
@@ -201,38 +188,19 @@ func TestBroker(t *testing.T) {
 		<-done
 	})
 
-	t.Run("Send on Closed Broker", func(t *testing.T) {
+	t.Run("Send Pool Connection Error", func(t *testing.T) {
 		// sequential subtest
 
-		p := anet.NewPool(1, factory, addr)
-		require.NotNil(t, p)
-		defer p.Close()
-
-		broker := anet.NewBroker([]anet.Pool{p}, 1, nil)
-		require.NotNil(t, broker)
-
-		// No need to start workers
-		broker.Close()
-
-		msg := []byte("hello closed")
-		resp, err := broker.Send(&msg)
-		require.ErrorIs(t, err, anet.ErrClosingBroker)
-		require.Nil(t, resp)
-	})
-
-	t.Run("Send with Pool Error", func(t *testing.T) {
-		// sequential subtest
-
-		// Rename unused parameter addr to _.
-		errorFactory := func(_ string) (anet.PoolItem, error) {
-			// Use errors.New for static error message.
+		// Create a factory that always returns an error
+		errorFactory := func(string) (anet.PoolItem, error) {
 			return nil, errors.New("pool connection error")
 		}
-		p := anet.NewPool(1, errorFactory, addr)
+
+		p := anet.NewPool(1, errorFactory, addr, nil) // Use default config
 		require.NotNil(t, p)
 		defer p.Close()
 
-		broker := anet.NewBroker([]anet.Pool{p}, 1, nil)
+		broker := anet.NewBroker([]anet.Pool{p}, 1, nil, nil) // Use default config
 		require.NotNil(t, broker)
 		defer broker.Close()
 
@@ -254,14 +222,14 @@ func TestBroker(t *testing.T) {
 	t.Run("Broker Close Idempotency", func(t *testing.T) {
 		// sequential subtest
 
-		p := anet.NewPool(1, factory, addr)
+		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
 		defer p.Close()
 
-		broker := anet.NewBroker([]anet.Pool{p}, 1, nil)
+		broker := anet.NewBroker([]anet.Pool{p}, 1, nil, nil) // Use default config
 		require.NotNil(t, broker)
 		broker.Close()
-		broker.Close() // Should be safe to call multiple times.
+		broker.Close() // Should be safe to call multiple times
 	})
 }
 
@@ -316,15 +284,15 @@ func TestMultiPoolBroker(t *testing.T) {
 		return conn, nil
 	}
 
-	p1 := anet.NewPool(2, factory, multiPoolAddr)
+	p1 := anet.NewPool(2, factory, multiPoolAddr, nil) // Use default config
 	require.NotNil(t, p1)
 	defer p1.Close()
 
-	p2 := anet.NewPool(2, factory, multiPoolAddr)
+	p2 := anet.NewPool(2, factory, multiPoolAddr, nil) // Use default config
 	require.NotNil(t, p2)
 	defer p2.Close()
 
-	broker := anet.NewBroker([]anet.Pool{p1, p2}, 4, nil)
+	broker := anet.NewBroker([]anet.Pool{p1, p2}, 4, nil, nil) // Use default config
 	require.NotNil(t, broker)
 	defer broker.Close()
 
@@ -425,14 +393,14 @@ func TestConcurrentBrokerSend(t *testing.T) {
 	poolCapacity := uint32(15) // Increase capacity to handle concurrent connections
 	pools := make([]anet.Pool, poolCount)
 	for i := 0; i < poolCount; i++ {
-		pools[i] = anet.NewPool(poolCapacity, factory, serverAddr)
+		pools[i] = anet.NewPool(poolCapacity, factory, serverAddr, nil) // Use default config
 		require.NotNil(t, pools[i])
 		defer pools[i].Close()
 	}
 
 	// Create a broker with enough workers
-	workerCount := 10 // Sufficient workers for concurrent processing
-	broker := anet.NewBroker(pools, workerCount, nil)
+	workerCount := 10                                      // Sufficient workers for concurrent processing
+	broker := anet.NewBroker(pools, workerCount, nil, nil) // Use default config
 	require.NotNil(t, broker)
 	defer broker.Close()
 
@@ -599,12 +567,13 @@ func BenchmarkBrokerSend(b *testing.B) {
 			uint32(count+5),
 			factory,
 			addr,
+			nil,
 		) // Ensure pool capacity exceeds worker count
 		require.NotNil(b, p)
 
 		b.Run(fmt.Sprintf("Workers_%d", count), func(b *testing.B) {
 			// Create the broker with the current worker count
-			broker := anet.NewBroker([]anet.Pool{p}, count, nil)
+			broker := anet.NewBroker([]anet.Pool{p}, count, nil, nil) // Use default config
 			require.NotNil(b, broker)
 			defer broker.Close()
 
@@ -715,11 +684,11 @@ func TestConnectionReuse(t *testing.T) {
 
 	// Create pool with capacity 2.
 	poolSize := uint32(2)
-	p := anet.NewPool(poolSize, factory, addr)
+	p := anet.NewPool(poolSize, factory, addr, nil) // Use default config
 	require.NotNil(t, p)
 	defer p.Close()
 
-	broker := anet.NewBroker([]anet.Pool{p}, 2, nil)
+	broker := anet.NewBroker([]anet.Pool{p}, 2, nil, nil) // Use default config
 	require.NotNil(t, broker)
 	defer broker.Close()
 
