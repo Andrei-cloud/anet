@@ -80,6 +80,7 @@ type broker struct {
 	rng     *rand.Rand
 	wg      sync.WaitGroup
 	closing atomic.Bool
+	started atomic.Bool
 	config  *BrokerConfig
 }
 
@@ -144,6 +145,19 @@ func (b *broker) Start() error {
 
 // Send sends a request and waits for the response.
 func (b *broker) Send(req *[]byte) ([]byte, error) {
+	// Return error if no pool connections are available.
+	allUsed := true
+	for _, p := range b.compool {
+		if p.Len() < p.Cap() {
+			allUsed = false
+			break
+		}
+	}
+
+	if allUsed {
+		return nil, ErrClosingBroker
+	}
+
 	task := b.newTask(context.Background(), req)
 
 	b.mu.Lock()
@@ -160,17 +174,21 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 	case <-b.ctx.Done():
 		b.mu.Unlock()
 		b.failPending(task)
+
 		return nil, ErrClosingBroker
 	default:
 		b.mu.Unlock()
 		b.failPending(task)
+
 		return nil, ErrClosingBroker
 	}
 
 	select {
 	case resp := <-task.response:
+
 		return resp, nil
 	case err := <-task.errCh:
+
 		return nil, err
 	}
 }

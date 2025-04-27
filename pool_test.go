@@ -356,6 +356,107 @@ func TestPool(t *testing.T) {
 			// require.Empty(t, errors, "Concurrent pool operations produced errors")
 		}
 	})
+
+	t.Run("Get With Invalid Connection", func(t *testing.T) {
+		// Create a factory that returns an invalid connection
+		invalidFactory := func(addr string) (anet.PoolItem, error) {
+			conn, err := net.DialTimeout("tcp", "localhost:1", 500*time.Millisecond)
+			if err != nil {
+				return nil, err
+			}
+			return conn, nil
+		}
+
+		p := anet.NewPool(1, invalidFactory, addr, nil)
+		require.NotNil(t, p)
+		defer p.Close()
+
+		// First Get should return error due to invalid connection
+		item, err := p.Get()
+		require.Error(t, err)
+		require.Nil(t, item)
+	})
+
+	t.Run("validateIdleConnections", func(t *testing.T) {
+		config := &anet.PoolConfig{
+			ValidationInterval: 100 * time.Millisecond,
+		}
+		p := anet.NewPool(2, factory, addr, config)
+		require.NotNil(t, p)
+		defer p.Close()
+
+		// Get two connections
+		item1, err := p.Get()
+		if err != nil {
+			t.Skipf("Skipping test due to connection error: %v", err)
+			return
+		}
+		item2, err := p.Get()
+		if err != nil {
+			p.Put(item1)
+			t.Skipf("Skipping test due to connection error: %v", err)
+			return
+		}
+
+		// Put them back to make them idle
+		p.Put(item1)
+		p.Put(item2)
+
+		// Make one connection invalid
+		if conn, ok := item1.(net.Conn); ok {
+			conn.Close()
+		}
+
+		// Wait for validation to run
+		time.Sleep(150 * time.Millisecond)
+
+		// Pool should now have only one valid connection
+		require.Equal(t, 1, p.Len())
+	})
+
+	t.Run("Release Invalid Connection", func(t *testing.T) {
+		p := anet.NewPool(1, factory, addr, nil)
+		require.NotNil(t, p)
+		defer p.Close()
+
+		item, err := p.Get()
+		if err != nil {
+			t.Skipf("Skipping test due to connection error: %v", err)
+			return
+		}
+
+		// Make connection invalid
+		if conn, ok := item.(net.Conn); ok {
+			conn.Close()
+		}
+
+		// Release should handle invalid connection gracefully
+		p.Release(item)
+		require.Equal(t, 0, p.Len())
+	})
+
+	t.Run("GetWithContext Pool Full", func(t *testing.T) {
+		p := anet.NewPool(1, factory, addr, nil)
+		require.NotNil(t, p)
+		defer p.Close()
+
+		// Get the only connection
+		item, err := p.Get()
+		if err != nil {
+			t.Skipf("Skipping test due to connection error: %v", err)
+			return
+		}
+		defer p.Put(item)
+
+		// Try to get another connection with short timeout
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+
+		item2, err := p.GetWithContext(ctx)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, context.DeadlineExceeded))
+		require.Nil(t, item2)
+	})
 }
 
 func BenchmarkPool(b *testing.B) {

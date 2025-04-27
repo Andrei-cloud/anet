@@ -231,6 +231,118 @@ func TestBroker(t *testing.T) {
 		broker.Close()
 		broker.Close() // Should be safe to call multiple times
 	})
+
+	t.Run("Send with Queue Full", func(t *testing.T) {
+		// sequential subtest
+		config := &anet.BrokerConfig{
+			QueueSize:    1,
+			WriteTimeout: 100 * time.Millisecond,
+			ReadTimeout:  100 * time.Millisecond,
+		}
+
+		// Create a pool with small capacity
+		p := anet.NewPool(1, factory, addr, nil)
+		require.NotNil(t, p)
+		defer p.Close()
+
+		broker := anet.NewBroker([]anet.Pool{p}, 1, nil, config)
+		require.NotNil(t, broker)
+		defer broker.Close()
+
+		// Block the only available connection
+		item, err := p.Get()
+		if err != nil {
+			t.Skip("Skipping test due to connection error")
+			return
+		}
+		defer p.Put(item)
+
+		// Try to send when no connections are available
+		msg := []byte("overflow")
+		_, err = broker.Send(&msg)
+		require.Error(t, err)
+		require.Equal(t, anet.ErrClosingBroker, err)
+	})
+
+	t.Run("SendContext with Multiple Pools", func(t *testing.T) {
+		// sequential subtest
+		p1 := anet.NewPool(1, factory, addr, nil)
+		p2 := anet.NewPool(1, factory, addr, nil)
+		require.NotNil(t, p1)
+		require.NotNil(t, p2)
+		defer p1.Close()
+		defer p2.Close()
+
+		broker := anet.NewBroker([]anet.Pool{p1, p2}, 2, nil, nil)
+		require.NotNil(t, broker)
+
+		// Start broker workers
+		done := make(chan error, 1)
+		go func() {
+			done <- broker.Start()
+		}()
+
+		// Wait for broker to start
+		time.Sleep(50 * time.Millisecond)
+
+		// Send multiple concurrent requests
+		var wg sync.WaitGroup
+		concurrentRequests := 4
+		wg.Add(concurrentRequests)
+
+		for i := 0; i < concurrentRequests; i++ {
+			go func(id int) {
+				defer wg.Done()
+				msg := []byte(fmt.Sprintf("concurrent-%d", id))
+				ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+				defer cancel()
+
+				resp, err := broker.SendContext(ctx, &msg)
+				if err != nil {
+					if strings.Contains(err.Error(), "connection refused") {
+						return
+					}
+					require.NoError(t, err)
+				}
+				require.Equal(t, msg, resp)
+			}(i)
+		}
+
+		wg.Wait()
+		broker.Close()
+		<-done
+	})
+
+	t.Run("SendContext with Pool Shutdown", func(t *testing.T) {
+		// sequential subtest
+		p := anet.NewPool(1, factory, addr, nil)
+		require.NotNil(t, p)
+
+		broker := anet.NewBroker([]anet.Pool{p}, 1, nil, nil)
+		require.NotNil(t, broker)
+
+		// Start broker workers
+		done := make(chan error, 1)
+		go func() {
+			done <- broker.Start()
+		}()
+
+		// Wait for broker to start
+		time.Sleep(50 * time.Millisecond)
+
+		// Close pool while broker is running
+		p.Close()
+
+		msg := []byte("after pool close")
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		_, err := broker.SendContext(ctx, &msg)
+		require.Error(t, err)
+
+		broker.Close()
+		<-done
+	})
 }
 
 // TestMultiPoolBroker tests the broker with multiple pools.
