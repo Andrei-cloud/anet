@@ -18,7 +18,7 @@ var (
 	ErrTimeout = errors.New("timeout on response")
 
 	// ErrQuit indicates the broker is shutting down normally.
-	ErrQuit = errors.New("broker is quiting")
+	ErrQuit = errors.New("broker is quitting")
 
 	// ErrClosingBroker indicates the broker is in the process of closing.
 	ErrClosingBroker = errors.New("broker is closing")
@@ -37,15 +37,6 @@ type BrokerConfig struct {
 	QueueSize int
 }
 
-// DefaultBrokerConfig returns the default broker configuration.
-func DefaultBrokerConfig() *BrokerConfig {
-	return &BrokerConfig{
-		WriteTimeout: 5 * time.Second,
-		ReadTimeout:  5 * time.Second,
-		QueueSize:    1000,
-	}
-}
-
 // Broker coordinates sending requests and receiving responses over pooled connections.
 type Broker interface {
 	Send(*[]byte) ([]byte, error)
@@ -56,11 +47,11 @@ type Broker interface {
 
 // Logger handles structured logging for the broker.
 type Logger interface {
-	Print(v ...any)                 // Info level
-	Printf(format string, v ...any) // Info level formatted
-	Infof(format string, v ...any)  // Info level with formatting
-	Warnf(format string, v ...any)  // Warning level
-	Errorf(format string, v ...any) // Error level
+	Print(v ...any)                 // Info level.
+	Printf(format string, v ...any) // Info level formatted.
+	Infof(format string, v ...any)  // Info level with formatting.
+	Warnf(format string, v ...any)  // Warning level.
+	Errorf(format string, v ...any) // Error level.
 }
 
 // broker implements the Broker interface.
@@ -86,6 +77,15 @@ type broker struct {
 
 // NoopLogger provides a default no-op logger.
 type NoopLogger struct{}
+
+// DefaultBrokerConfig returns the default broker configuration.
+func DefaultBrokerConfig() *BrokerConfig {
+	return &BrokerConfig{
+		WriteTimeout: 5 * time.Second,
+		ReadTimeout:  5 * time.Second,
+		QueueSize:    1000,
+	}
+}
 
 func (l *NoopLogger) Print(_ ...any)            {}
 func (l *NoopLogger) Printf(_ string, _ ...any) {}
@@ -128,12 +128,15 @@ func (b *broker) Start() error {
 		b.wg.Add(1)
 		eg.Go(func() error {
 			defer b.wg.Done()
+
 			err := b.loop(workerID)
+
 			return err
 		})
 	}
 
 	err := eg.Wait()
+
 	if err != nil && !errors.Is(err, ErrQuit) {
 		b.logger.Errorf("Broker stopped with error: %v", err)
 	} else {
@@ -163,6 +166,7 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 	b.mu.Lock()
 	if b.closing.Load() {
 		b.mu.Unlock()
+
 		return nil, ErrClosingBroker
 	}
 
@@ -200,6 +204,7 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 	b.mu.Lock()
 	if b.closing.Load() {
 		b.mu.Unlock()
+
 		return nil, ErrClosingBroker
 	}
 
@@ -211,24 +216,30 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 	case <-b.ctx.Done():
 		b.mu.Unlock()
 		b.failPending(task)
+
 		return nil, ErrClosingBroker
 	case <-ctx.Done():
 		b.mu.Unlock()
 		b.failPending(task)
+
 		return nil, ctx.Err()
 	default:
 		b.mu.Unlock()
 		b.failPending(task)
+
 		return nil, ErrClosingBroker
 	}
 
 	select {
 	case resp := <-task.response:
+
 		return resp, nil
 	case err := <-task.errCh:
+
 		return nil, err
 	case <-ctx.Done():
 		b.failPending(task)
+
 		return nil, ctx.Err()
 	}
 }
@@ -238,6 +249,7 @@ func (b *broker) Close() {
 	b.mu.Lock()
 	if b.closing.Load() {
 		b.mu.Unlock()
+
 		return
 	}
 	b.closing.Store(true)
@@ -302,6 +314,7 @@ func (b *broker) loop(workerID int) error {
 	for {
 		select {
 		case <-b.ctx.Done():
+
 			return ErrQuit
 		case task, ok := <-b.requestQueue:
 			if !ok {
@@ -310,6 +323,7 @@ func (b *broker) loop(workerID int) error {
 
 			if b.closing.Load() {
 				b.trySendError(task, ErrClosingBroker)
+
 				continue
 			}
 
@@ -359,6 +373,7 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 	if !ok {
 		err := errors.New("internal error: pool item is not net.Conn")
 		b.trySendError(task, err)
+
 		return err
 	}
 
@@ -376,23 +391,27 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 
 	if b.closing.Load() {
 		b.trySendError(task, ErrClosingBroker)
+
 		return ErrClosingBroker
 	}
 
 	writeDeadline := time.Now().Add(b.config.WriteTimeout)
 	if err := netConn.SetWriteDeadline(writeDeadline); err != nil {
 		b.trySendError(task, fmt.Errorf("setting write deadline: %w", err))
+
 		return err
 	}
 
 	if err := Write(netConn, cmd); err != nil {
 		b.trySendError(task, fmt.Errorf("writing to connection: %w", err))
+
 		return err
 	}
 
 	readDeadline := time.Now().Add(b.config.ReadTimeout)
 	if err := netConn.SetReadDeadline(readDeadline); err != nil {
 		b.trySendError(task, fmt.Errorf("setting read deadline: %w", err))
+
 		return err
 	}
 
@@ -414,6 +433,7 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 		select {
 		case <-taskCtx.Done():
 			err := taskCtx.Err()
+
 			return err
 		case <-done:
 			if readErr != nil {
@@ -425,6 +445,7 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 		if err != nil {
 			wrappedErr := fmt.Errorf("reading from connection: %w", err)
 			b.trySendError(task, wrappedErr)
+
 			return wrappedErr
 		}
 		b.respondPending(resp)
