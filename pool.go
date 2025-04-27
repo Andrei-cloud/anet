@@ -26,16 +26,6 @@ type PoolConfig struct {
 	KeepAliveInterval time.Duration
 }
 
-// DefaultPoolConfig returns the default configuration.
-func DefaultPoolConfig() *PoolConfig {
-	return &PoolConfig{
-		DialTimeout:        5 * time.Second,
-		IdleTimeout:        60 * time.Second,
-		ValidationInterval: 30 * time.Second,
-		KeepAliveInterval:  30 * time.Second,
-	}
-}
-
 // Pool manages a collection of reusable connections.
 type Pool interface {
 	Get() (PoolItem, error)
@@ -69,6 +59,16 @@ type pool struct {
 	stopChan    chan struct{}
 }
 
+// DefaultPoolConfig returns the default configuration.
+func DefaultPoolConfig() *PoolConfig {
+	return &PoolConfig{
+		DialTimeout:        5 * time.Second,
+		IdleTimeout:        60 * time.Second,
+		ValidationInterval: 30 * time.Second,
+		KeepAliveInterval:  30 * time.Second,
+	}
+}
+
 // NewPoolList creates a list of Pool interfaces from a slice of addresses.
 func NewPoolList(poolCap uint32, f Factory, addrs []string, config *PoolConfig) []Pool {
 	if config == nil {
@@ -99,7 +99,7 @@ func NewPool(poolCap uint32, f Factory, addr string, config *PoolConfig) Pool {
 	}
 	p.closing.Store(false)
 
-	// Start background validation if interval is set
+	// Start background validation if interval is set.
 	if p.config.ValidationInterval > 0 {
 		go p.validateIdleConnections()
 	}
@@ -118,7 +118,7 @@ func (p *pool) validateConnection(item PoolItem) bool {
 			return false
 		}
 
-		// Check if connection has been idle too long
+		// Check if connection has been idle too long.
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			if err := tcpConn.SetKeepAlive(true); err != nil {
 				return false
@@ -127,19 +127,19 @@ func (p *pool) validateConnection(item PoolItem) bool {
 				return false
 			}
 
-			// Set a short read deadline to check if the connection is still alive
+			// Set a short read deadline to check if the connection is still alive.
 			if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 				return false
 			}
 
-			// Try to read 0 bytes to check connection status
+			// Try to read 0 bytes to check connection status.
 			if _, err := conn.Read(make([]byte, 0)); err != nil {
 				if !os.IsTimeout(err) { // timeout is expected and means connection is still good
 					return false
 				}
 			}
 
-			// Reset the deadline
+			// Reset the deadline.
 			if err := conn.SetReadDeadline(time.Time{}); err != nil {
 				return false
 			}
@@ -162,9 +162,10 @@ func (p *pool) validateIdleConnections() {
 			p.mu.Lock()
 			if p.closing.Load() {
 				p.mu.Unlock()
+
 				return
 			}
-			// Copy current items to a slice for validation
+			// Copy current items to a slice for validation.
 			items := make([]PoolItem, 0, len(p.queue))
 			for len(p.queue) > 0 {
 				if item := <-p.queue; item != nil {
@@ -173,7 +174,7 @@ func (p *pool) validateIdleConnections() {
 			}
 			p.mu.Unlock()
 
-			// Validate each connection
+			// Validate each connection.
 			for _, item := range items {
 				if p.validateConnection(item) {
 					p.Put(item)
@@ -191,7 +192,7 @@ func (p *pool) Get() (PoolItem, error) {
 		return nil, ErrClosing
 	}
 
-	// Try to get an existing connection from the queue
+	// Try to get an existing connection from the queue.
 	select {
 	case item := <-p.queue:
 		if item == nil {
@@ -206,7 +207,7 @@ func (p *pool) Get() (PoolItem, error) {
 	default:
 	}
 
-	// Try to create a new connection if under capacity
+	// Try to create a new connection if under capacity.
 	current := p.count.Load()
 	if current < p.capacity {
 		if p.count.CompareAndSwap(current, current+1) {
@@ -221,7 +222,7 @@ func (p *pool) Get() (PoolItem, error) {
 		}
 	}
 
-	// Wait for a connection to become available
+	// Wait for a connection to become available.
 	item := <-p.queue
 	if item == nil {
 		return nil, ErrClosing
@@ -233,7 +234,7 @@ func (p *pool) Get() (PoolItem, error) {
 
 	p.Release(item)
 
-	return p.Get() // Recursively try again if connection is invalid
+	return p.Get()
 }
 
 // GetWithContext retrieves an item with context awareness.
@@ -242,7 +243,7 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 		return nil, ErrClosing
 	}
 
-	// Fast path: try to get an existing connection
+	// Fast path: try to get an existing connection.
 	select {
 	case item := <-p.queue:
 		if item == nil {
@@ -253,11 +254,12 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 		}
 		p.Release(item)
 	case <-ctx.Done():
+
 		return nil, ctx.Err()
 	default:
 	}
 
-	// Try to create a new connection if under capacity
+	// Try to create a new connection if under capacity.
 	current := p.count.Load()
 	if current < p.capacity {
 		if p.count.CompareAndSwap(current, current+1) {
@@ -272,7 +274,7 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 		}
 	}
 
-	// Wait for an available connection or context cancellation
+	// Wait for an available connection or context cancellation.
 	for {
 		select {
 		case item := <-p.queue:
@@ -284,6 +286,7 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 			}
 			p.Release(item)
 		case <-ctx.Done():
+
 			return nil, ctx.Err()
 		}
 	}
@@ -330,13 +333,13 @@ func (p *pool) Release(item PoolItem) {
 
 // Close closes the pool and all its items.
 func (p *pool) Close() {
-	// Fast check to avoid lock if already closing
+	// Fast check to avoid lock if already closing.
 	if p.closing.Load() {
 		return
 	}
 
 	p.mu.Lock()
-	// Double check after acquiring lock
+	// Double check after acquiring lock.
 	if p.closing.Load() {
 		p.mu.Unlock()
 
@@ -346,7 +349,7 @@ func (p *pool) Close() {
 	close(p.queue)
 	close(p.stopChan)
 
-	// Collect items to close outside the lock
+	// Collect items to close outside the lock.
 	itemsToClose := make([]PoolItem, 0, cap(p.queue))
 	for item := range p.queue {
 		if item != nil {
@@ -355,7 +358,7 @@ func (p *pool) Close() {
 	}
 	p.mu.Unlock()
 
-	// Release items outside the lock
+	// Release items outside the lock.
 	for _, item := range itemsToClose {
 		p.Release(item)
 	}
