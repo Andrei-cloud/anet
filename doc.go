@@ -27,6 +27,29 @@
 //   - Structured logging interface for observability.
 //   - Graceful shutdown handling.
 //
+// 4. TCP Server (server/server.go, server_config.go, handler.go):
+//   - Embeddable framework to accept and process framed messages over TCP using the anet protocol.
+//   - ServerConfig allows tuning of ReadTimeout, WriteTimeout, IdleTimeout, MaxConns, KeepAliveInterval, ShutdownTimeout, and optional Logger.
+//   - Handler and HandlerFunc types define the application message processor interface.
+//   - Server struct manages listener, active connections, and graceful shutdown.
+//   - Start begins accepting connections and dispatches messages to Handler.
+//   - Stop signals shutdown, closes listener and active connections, and waits for handlers to finish.
+//
+// Basic Server Usage Example:
+//
+//	handler := HandlerFunc(func(conn *ServerConn, req []byte) ([]byte, error) {
+//	    // process request and return response.
+//	    return req, nil.
+//	})
+//	srv, err := NewServer(":9000", handler, nil)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	go srv.Start()  // run in background.
+//	defer srv.Stop()
+//
+// Note: Server reuses anet.Read and anet.Write for framing and supports concurrent requests via Task ID correlation.
+//
 // Configuration:
 //
 // The library provides configuration structures for both pool and broker:

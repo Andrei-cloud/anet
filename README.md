@@ -32,6 +32,12 @@ go get github.com/andrei-cloud/anet
     * Built-in buffer pooling for efficient memory usage.
     * Comprehensive error handling for invalid lengths and size limits.
 
+* **TCP Server (`server/server.go`, `server_config.go`, `handler.go`)**: Embeddable framework to accept and process framed messages over TCP using the anet protocol.
+    * ServerConfig allows tuning ReadTimeout, WriteTimeout, IdleTimeout, KeepAliveInterval, MaxConns, and ShutdownTimeout.
+    * Handler interface and HandlerFunc adapter define application message processor.
+    * Server struct manages listener, active connections, and graceful shutdown via Start and Stop.
+    * Reuses anet.Read and anet.Write for consistent framing and Task ID correlation.
+
 ## Configuration
 
 ### Pool Configuration
