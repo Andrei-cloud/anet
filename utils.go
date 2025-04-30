@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // Message framing constants.
@@ -24,6 +25,8 @@ var (
 	ErrMaxLenExceeded = errors.New("maximum message length exceeded")
 )
 
+var writeBufPool = sync.Pool{New: func() any { return make([]byte, 0, 4096) }}
+
 // Write sends data over a connection using the message framing protocol.
 // It prepends a big-endian length header of LENGTHSIZE bytes to the data.
 // The maximum message size is determined by LENGTHSIZE (65535 bytes for uint16).
@@ -40,32 +43,33 @@ func Write(w io.Writer, in []byte) error {
 		return ErrMaxLenExceeded
 	}
 
-	// Get a buffer from the pool for the header.
-	headerBuf := globalBufferPool.getBuffer(LENGTHSIZE)
-	defer globalBufferPool.putBuffer(headerBuf)
+	// Build frame in a single buffer.
+	buf := writeBufPool.Get().([]byte)[:0]
+	// reserve space for length header.
+	for i := 0; i < LENGTHSIZE; i++ {
+		buf = append(buf, 0)
+	}
+	buf = append(buf, in...)
 
-	// Write length as big-endian value.
+	// write length header into reserved space.
 	switch LENGTHSIZE {
 	case 2:
-		binary.BigEndian.PutUint16(headerBuf, uint16(len(in)))
+		binary.BigEndian.PutUint16(buf, uint16(len(buf)-LENGTHSIZE))
 	case 4:
-		binary.BigEndian.PutUint32(headerBuf, uint32(len(in)))
+		binary.BigEndian.PutUint32(buf, uint32(len(buf)-LENGTHSIZE))
 	default:
 
 		return fmt.Errorf("unsupported header size: %d", LENGTHSIZE)
 	}
 
-	// Write the header.
-	if _, err := w.Write(headerBuf[:LENGTHSIZE]); err != nil {
+	if _, err := w.Write(buf); err != nil {
+		writeBufPool.Put(buf)
+
 		return err
 	}
 
-	// Write the payload.
-	if _, err := w.Write(in); err != nil {
-		return err
-	}
+	writeBufPool.Put(buf)
 
-	// Return nil on success.
 	return nil
 }
 
