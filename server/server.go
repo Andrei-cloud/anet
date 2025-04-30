@@ -9,6 +9,10 @@ import (
 	"github.com/andrei-cloud/anet"
 )
 
+var frameBufferPool = sync.Pool{
+	New: func() any { return make([]byte, 0, 4096) },
+} // pool for message frames.
+
 type Server struct {
 	address     string         // network address to listen on.
 	listener    net.Listener   // TCP listener for incoming connections.
@@ -195,7 +199,13 @@ func (s *Server) dispatchMessage(sc *ServerConn, taskID []byte, request []byte) 
 			return
 		}
 
-		buf := make([]byte, len(taskID)+len(resp))
+		// reuse buffer for taskID+resp to reduce allocations.
+		buf := frameBufferPool.Get().([]byte)
+		required := len(taskID) + len(resp)
+		if cap(buf) < required {
+			buf = make([]byte, required)
+		}
+		buf = buf[:required]
 		copy(buf[:4], taskID)
 		copy(buf[4:], resp)
 
@@ -208,6 +218,9 @@ func (s *Server) dispatchMessage(sc *ServerConn, taskID []byte, request []byte) 
 
 		writeErr := anet.Write(sc.Conn, buf)
 		sc.writeMu.Unlock()
+
+		// return buffer to pool.
+		frameBufferPool.Put(buf[:0])
 
 		if writeErr != nil {
 			s.logf("write error: %v", writeErr)
