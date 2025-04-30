@@ -10,7 +10,9 @@ import (
 )
 
 func TestServerEcho(t *testing.T) {
-	handler := HandlerFunc(func(sc *ServerConn, req []byte) ([]byte, error) {
+	t.Parallel() // run test in parallel.
+
+	handler := HandlerFunc(func(_ *ServerConn, req []byte) ([]byte, error) {
 		return req, nil
 	})
 	srv, err := NewServer("127.0.0.1:0", handler, nil)
@@ -20,7 +22,11 @@ func TestServerEcho(t *testing.T) {
 	if err := srv.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer srv.Stop()
+	defer func() {
+		if err := srv.Stop(); err != nil {
+			t.Fatal(err)
+		}
+	}()
 
 	addr := srv.listener.Addr().String()
 
@@ -28,7 +34,11 @@ func TestServerEcho(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
 
 	payload := []byte("hello")
 	taskID := [4]byte{0x01, 0x02, 0x03, 0x04}
@@ -38,7 +48,9 @@ func TestServerEcho(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	conn.SetReadDeadline(time.Now().Add(time.Second))
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
 
 	resp, err := anet.Read(conn)
 	if err != nil {

@@ -59,7 +59,9 @@ func (s *Server) Stop() error {
 
 	s.activeConns.Range(func(_, val any) bool {
 		if c, ok := val.(*ServerConn); ok {
-			c.Conn.Close()
+			if err := c.Conn.Close(); err != nil {
+				s.logf("connection close error: %v", err)
+			}
 		}
 
 		return true
@@ -116,7 +118,9 @@ func (s *Server) acceptLoop() {
 				return true
 			})
 			if count >= s.config.MaxConns {
-				conn.Close()
+				if err := conn.Close(); err != nil {
+					s.logf("connection close error: %v", err)
+				}
 
 				continue
 			}
@@ -144,14 +148,18 @@ func (s *Server) connectionLoop(sc *ServerConn) {
 	defer func() {
 		s.removeConnection(sc)
 
-		sc.Conn.Close()
+		if err := sc.Conn.Close(); err != nil {
+			s.logf("connection close error: %v", err)
+		}
 
 		s.connWG.Done()
 	}()
 
 	for {
 		if s.config.IdleTimeout > 0 {
-			sc.Conn.SetReadDeadline(time.Now().Add(s.config.IdleTimeout))
+			if err := sc.Conn.SetReadDeadline(time.Now().Add(s.config.IdleTimeout)); err != nil {
+				s.logf("set read deadline error: %v", err)
+			}
 		}
 
 		msg, err := anet.Read(sc.Conn)
@@ -193,7 +201,9 @@ func (s *Server) dispatchMessage(sc *ServerConn, taskID []byte, request []byte) 
 
 		sc.writeMu.Lock()
 		if s.config.WriteTimeout > 0 {
-			sc.Conn.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout))
+			if err := sc.Conn.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout)); err != nil {
+				s.logf("set write deadline error: %v", err)
+			}
 		}
 
 		writeErr := anet.Write(sc.Conn, buf)
@@ -202,7 +212,9 @@ func (s *Server) dispatchMessage(sc *ServerConn, taskID []byte, request []byte) 
 		if writeErr != nil {
 			s.logf("write error: %v", writeErr)
 
-			sc.Conn.Close()
+			if err := sc.Conn.Close(); err != nil {
+				s.logf("connection close error: %v", err)
+			}
 		}
 	}()
 }

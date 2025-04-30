@@ -16,9 +16,13 @@ type ServerConn struct {
 func (sc *ServerConn) init() {
 	if tcpConn, ok := sc.Conn.(*net.TCPConn); ok {
 		if sc.server.config.KeepAliveInterval > 0 {
-			tcpConn.SetKeepAlive(true)
+			if err := tcpConn.SetKeepAlive(true); err != nil {
+				sc.server.logf("set keepalive error: %v", err)
+			}
 
-			tcpConn.SetKeepAlivePeriod(sc.server.config.KeepAliveInterval)
+			if err := tcpConn.SetKeepAlivePeriod(sc.server.config.KeepAliveInterval); err != nil {
+				sc.server.logf("set keepalive period error: %v", err)
+			}
 		}
 	}
 }

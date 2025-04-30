@@ -44,6 +44,7 @@ func Write(w io.Writer, in []byte) error {
 	}
 
 	// Build frame in a single buffer.
+	//nolint:staticcheck,errcheck // ignoring errors for buffer pool Get and pointer-like warning
 	buf := writeBufPool.Get().([]byte)[:0]
 	// reserve space for length header.
 	for i := 0; i < LENGTHSIZE; i++ {
@@ -63,11 +64,13 @@ func Write(w io.Writer, in []byte) error {
 	}
 
 	if _, err := w.Write(buf); err != nil {
+		//nolint:staticcheck,errcheck // ignoring errors for buffer pool Put
 		writeBufPool.Put(buf)
 
 		return err
 	}
 
+	//nolint:staticcheck,errcheck // ignoring errors for buffer pool Put
 	writeBufPool.Put(buf)
 
 	return nil

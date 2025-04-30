@@ -29,7 +29,8 @@
 //
 // 4. TCP Server (server/server.go, server_config.go, handler.go):
 //   - Embeddable framework to accept and process framed messages over TCP using the anet protocol.
-//   - ServerConfig allows tuning of ReadTimeout, WriteTimeout, IdleTimeout, MaxConns, KeepAliveInterval, ShutdownTimeout, and optional Logger.
+//   - ServerConfig allows tuning of ReadTimeout, WriteTimeout, IdleTimeout,
+//     MaxConns, KeepAliveInterval, ShutdownTimeout, and optional Logger.
 //   - Handler and HandlerFunc types define the application message processor interface.
 //   - Server struct manages listener, active connections, and graceful shutdown.
 //   - Start begins accepting connections and dispatches messages to Handler.

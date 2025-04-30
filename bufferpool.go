@@ -49,7 +49,7 @@ func (bp *bufferPool) getBuffer(size int) []byte {
 		return make([]byte, size)
 	}
 
-	// Find the smallest pool that fits the size
+	// Find the smallest pool that fits the size.
 	poolIdx := 0
 	poolSize := 32
 	for poolSize < size {
@@ -57,7 +57,13 @@ func (bp *bufferPool) getBuffer(size int) []byte {
 		poolIdx++
 	}
 
-	return bp.pools[poolIdx].Get().([]byte)
+	// retrieve buffer from pool and check type assertion.
+	obj := bp.pools[poolIdx].Get()
+	if buf, ok := obj.([]byte); ok {
+		return buf
+	}
+	// fallback allocation if buffer type is not as expected.
+	return make([]byte, poolSize)
 }
 
 // putBuffer returns a buffer to the pool for future reuse.
@@ -76,5 +82,6 @@ func (bp *bufferPool) putBuffer(buf []byte) {
 		poolIdx++
 	}
 
+	//nolint:staticcheck // passing slice which is pointer-like
 	bp.pools[poolIdx].Put(buf)
 }

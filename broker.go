@@ -310,7 +310,7 @@ func (b *broker) Close() {
 
 // Internal methods.
 
-func (b *broker) loop(workerID int) error {
+func (b *broker) loop(_ int) error {
 	for {
 		select {
 		case <-b.ctx.Done():
