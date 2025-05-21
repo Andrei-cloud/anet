@@ -1,13 +1,15 @@
 # anet - Asynchronous Network Broker & Pool
+[![Go Reference](https://pkg.go.dev/badge/github.com/andrei-cloud/anet.svg)](https://pkg.go.dev/github.com/andrei-cloud/anet)
+[![Go Report Card](https://goreportcard.com/badge/github.com/andrei-cloud/anet)](https://goreportcard.com/report/github.com/andrei-cloud/anet)
 
-`anet` is a Go library providing components for efficient, asynchronous communication with network services, primarily featuring a connection pool and a message broker.
+ `anet` is a Go module providing components for efficient, asynchronous communication with network services, primarily featuring a connection pool and a message broker.
 
-## Installation
+ ## Installation
 
-```bash
-go get github.com/andrei-cloud/anet
-```
-
+ ```bash
+go get github.com/andrei-cloud/anet@latest
+ ```
+ 
 ## Features
 
 * **Connection Pooling (`pool.go`)**: Manages a pool of reusable network connections (`PoolItem`) to specified addresses.
@@ -52,10 +54,11 @@ type PoolConfig struct {
 
 ### Broker Configuration
 ```go
+// BrokerConfig holds settings for broker behavior and queue sizing.
 type BrokerConfig struct {
-    RequestTimeout     time.Duration // Maximum time to wait for response (default: 30s)
-    ShutdownTimeout   time.Duration // Maximum time to wait during shutdown (default: 5s)
-    MaxRetries        int          // Maximum retries for failed requests (default: 3)
+    WriteTimeout time.Duration // timeout for write operations (default: 5s).
+    ReadTimeout  time.Duration // timeout for read operations (default: 5s).
+    QueueSize    int           // request queue capacity (default: 1000).
 }
 ```
 
@@ -149,6 +152,16 @@ pools := anet.NewPoolList(
 ## Basic Usage Example
 
 See the [example/main.go](example/main.go) file for a complete working example including both server and client code.
+
+```go
+// client side:
+factory := func(addr string) (anet.PoolItem, error) { /* ... */ }
+pools := anet.NewPoolList(5, factory, []string{"localhost:9000"}, nil)
+brokerCfg := &anet.BrokerConfig{WriteTimeout: 5*time.Second, ReadTimeout: 5*time.Second, QueueSize: 1000}
+broker := anet.NewBroker(pools, 3, nil, brokerCfg)
+go broker.Start()
+resp, err := broker.Send(&[]byte("hello"))
+```
 
 ## Notes
 
