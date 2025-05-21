@@ -7,10 +7,31 @@ import (
 
 // maxBufferSize is the maximum size of buffers that will be pooled.
 // Larger buffers will be allocated but not pooled to prevent memory bloat.
-const maxBufferSize = 2 * 1024 // 2KB
+const maxBufferSize = 64 * 1024 // 64KB
 
-// Global buffer pool instance used by the message framing utilities.
-var globalBufferPool = newBufferPool()
+// globalBufferPool is a NUMA-aware wrapper around per-node buffer pools.
+var globalBufferPool = newGlobalBufferPool()
+
+// globalBufferPoolType manages buffer pools per NUMA node.
+type globalBufferPoolType struct {
+	pools []*bufferPool // one pool per NUMA node
+	nodes int           // number of NUMA nodes detected
+}
+
+// newGlobalBufferPool creates a NUMA-aware global buffer pool.
+func newGlobalBufferPool() *globalBufferPoolType {
+	nodes := detectNUMANodes()
+	pools := make([]*bufferPool, nodes)
+	for i := 0; i < nodes; i++ {
+		pools[i] = newBufferPool()
+	}
+	return &globalBufferPoolType{pools: pools, nodes: nodes}
+}
+
+// detectNUMANodes returns the number of NUMA nodes on this system. Defaults to 1.
+func detectNUMANodes() int {
+	return 1 // stub: real detection can be added via cgo or syscalls
+}
 
 // bufferPool manages a set of sync.Pool instances for different buffer sizes.
 // This helps reduce memory allocations and GC pressure by reusing buffers.
@@ -84,4 +105,15 @@ func (bp *bufferPool) putBuffer(buf []byte) {
 
 	//nolint:staticcheck // passing slice which is pointer-like
 	bp.pools[poolIdx].Put(buf)
+}
+
+// getBuffer retrieves a buffer from the local NUMA node pool.
+func (g *globalBufferPoolType) getBuffer(size int) []byte {
+	// for now, always use node 0
+	return g.pools[0].getBuffer(size)
+}
+
+// putBuffer returns a buffer to the local NUMA node pool.
+func (g *globalBufferPoolType) putBuffer(buf []byte) {
+	g.pools[0].putBuffer(buf)
 }

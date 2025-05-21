@@ -59,9 +59,8 @@ type broker struct {
 	mu           sync.Mutex
 	connMu       sync.RWMutex
 	workers      int
-	recvQueue    chan PoolItem
 	compool      []Pool
-	requestQueue chan *Task
+	requestQueue *RingBuffer[*Task]
 	pending      sync.Map
 	activeConns  sync.Map
 	//nolint:containedctx // Necessary for task cancellation within broker queue.
@@ -108,13 +107,99 @@ func NewBroker(p []Pool, n int, l Logger, config *BrokerConfig) Broker {
 	return &broker{
 		workers:      n,
 		compool:      p,
-		recvQueue:    make(chan PoolItem, n),
-		requestQueue: make(chan *Task, config.QueueSize),
+		requestQueue: NewRingBuffer[*Task](uint64(config.QueueSize)),
 		ctx:          ctx,
 		cancel:       cancel,
 		logger:       l,
 		rng:          rng,
 		config:       config,
+	}
+}
+
+// Send sends a request and waits for the response.
+func (b *broker) Send(req *[]byte) ([]byte, error) {
+	// Return error if no pool connections are available.
+	allUsed := true
+	for _, p := range b.compool {
+		if p.Len() < p.Cap() {
+			allUsed = false
+			break
+		}
+	}
+
+	if allUsed {
+		return nil, ErrClosingBroker
+	}
+
+	task := b.newTask(context.Background(), req)
+
+	b.mu.Lock()
+	if b.closing.Load() {
+		b.mu.Unlock()
+
+		return nil, ErrClosingBroker
+	}
+	b.pending.Store(string(task.taskID), task)
+	b.mu.Unlock()
+
+	// enqueue without blocking; fail if broker closing or queue full
+	if b.ctx.Err() != nil || !b.requestQueue.Enqueue(task) {
+		b.failPending(task)
+
+		return nil, ErrClosingBroker
+	}
+
+	select {
+	case resp := <-task.response:
+
+		return resp, nil
+	case err := <-task.errCh:
+
+		return nil, err
+	}
+}
+
+// SendContext sends a request with context support.
+func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
+	task := b.newTask(ctx, req)
+
+	b.mu.Lock()
+	if b.closing.Load() {
+		b.mu.Unlock()
+
+		return nil, ErrClosingBroker
+	}
+	b.pending.Store(string(task.taskID), task)
+	b.mu.Unlock()
+
+	// enqueue without blocking; handle context and broker closing
+	if b.ctx.Err() != nil {
+		b.failPending(task)
+
+		return nil, ErrClosingBroker
+	}
+	if ctx.Err() != nil {
+		b.failPending(task)
+
+		return nil, ctx.Err()
+	}
+	if !b.requestQueue.Enqueue(task) {
+		b.failPending(task)
+
+		return nil, ErrClosingBroker
+	}
+
+	select {
+	case resp := <-task.response:
+
+		return resp, nil
+	case err := <-task.errCh:
+
+		return nil, err
+	case <-ctx.Done():
+		b.failPending(task)
+
+		return nil, ctx.Err()
 	}
 }
 
@@ -146,225 +231,61 @@ func (b *broker) Start() error {
 	return err
 }
 
-// Send sends a request and waits for the response.
-func (b *broker) Send(req *[]byte) ([]byte, error) {
-	// Return error if no pool connections are available.
-	allUsed := true
-	for _, p := range b.compool {
-		if p.Len() < p.Cap() {
-			allUsed = false
-			break
-		}
-	}
-
-	if allUsed {
-		return nil, ErrClosingBroker
-	}
-
-	task := b.newTask(context.Background(), req)
-
-	b.mu.Lock()
-	if b.closing.Load() {
-		b.mu.Unlock()
-
-		return nil, ErrClosingBroker
-	}
-
-	b.pending.Store(string(task.taskID), task)
-
-	select {
-	case b.requestQueue <- task:
-		b.mu.Unlock()
-	case <-b.ctx.Done():
-		b.mu.Unlock()
-		b.failPending(task)
-
-		return nil, ErrClosingBroker
-	default:
-		b.mu.Unlock()
-		b.failPending(task)
-
-		return nil, ErrClosingBroker
-	}
-
-	select {
-	case resp := <-task.response:
-
-		return resp, nil
-	case err := <-task.errCh:
-
-		return nil, err
-	}
-}
-
-// SendContext sends a request with context support.
-func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
-	task := b.newTask(ctx, req)
-
-	b.mu.Lock()
-	if b.closing.Load() {
-		b.mu.Unlock()
-
-		return nil, ErrClosingBroker
-	}
-
-	b.pending.Store(string(task.taskID), task)
-
-	select {
-	case b.requestQueue <- task:
-		b.mu.Unlock()
-	case <-b.ctx.Done():
-		b.mu.Unlock()
-		b.failPending(task)
-
-		return nil, ErrClosingBroker
-	case <-ctx.Done():
-		b.mu.Unlock()
-		b.failPending(task)
-
-		return nil, ctx.Err()
-	default:
-		b.mu.Unlock()
-		b.failPending(task)
-
-		return nil, ErrClosingBroker
-	}
-
-	select {
-	case resp := <-task.response:
-
-		return resp, nil
-	case err := <-task.errCh:
-
-		return nil, err
-	case <-ctx.Done():
-		b.failPending(task)
-
-		return nil, ctx.Err()
-	}
-}
-
-// Close shuts down the broker and associated pools.
-func (b *broker) Close() {
-	b.mu.Lock()
-	if b.closing.Load() {
-		b.mu.Unlock()
-
-		return
-	}
-	b.closing.Store(true)
-	b.cancel()
-	b.mu.Unlock()
-
-	b.connMu.Lock()
-	b.activeConns.Range(func(key, value any) bool {
-		if conn, ok := value.(net.Conn); ok {
-			if err := conn.Close(); err != nil {
-				if keyStr, ok := key.(string); ok {
-					b.logger.Warnf("Error closing connection for task %s: %v", keyStr, err)
-				}
-			}
-		}
-		b.activeConns.Delete(key)
-
-		return true
-	})
-	b.connMu.Unlock()
-
-	done := make(chan struct{})
-	go func() {
-		b.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		b.logger.Warnf("Timeout waiting for workers to finish, forcing close.")
-	}
-
-	close(b.requestQueue)
-
-	b.pending.Range(func(key, value any) bool {
-		task, ok := value.(*Task)
-		if !ok {
-			return true
-		}
-		select {
-		case task.errCh <- ErrClosingBroker:
-		default:
-		}
-		close(task.response)
-		close(task.errCh)
-		b.pending.Delete(key)
-
-		return true
-	})
-
-	for _, p := range b.compool {
-		p.Close()
-	}
-
-	b.logger.Print("Broker closed.")
-}
-
-// Internal methods.
-
 func (b *broker) loop(_ int) error {
 	for {
-		select {
-		case <-b.ctx.Done():
-
+		// exit if broker is closing
+		if b.ctx.Err() != nil {
 			return ErrQuit
-		case task, ok := <-b.requestQueue:
-			if !ok {
-				return nil
-			}
-
-			if b.closing.Load() {
-				b.trySendError(task, ErrClosingBroker)
-
-				continue
-			}
-
-			taskCtx := task.Context()
-
-			b.connMu.RLock()
-			p := b.pickConnPool()
-			b.connMu.RUnlock()
-
-			if p == nil {
-				b.trySendError(task, ErrNoPoolsAvailable)
-
-				continue
-			}
-
-			var wr PoolItem
-			var err error
-			if taskCtx != nil {
-				wr, err = p.GetWithContext(taskCtx)
-			} else {
-				wr, err = p.Get()
-			}
-
-			if err != nil {
-				if taskCtx != nil && errors.Is(err, taskCtx.Err()) {
-					continue
-				}
-				b.trySendError(task, fmt.Errorf("failed to get connection: %w", err))
-
-				continue
-			}
-
-			err = b.handleConnection(task, wr)
-			if err != nil {
-				p.Release(wr)
-
-				continue
-			}
-
-			p.Put(wr)
 		}
+		// attempt to dequeue next task
+		task, ok := b.requestQueue.Dequeue()
+		if !ok {
+			continue // no task available
+		}
+
+		if b.closing.Load() {
+			b.trySendError(task, ErrClosingBroker)
+
+			continue
+		}
+
+		taskCtx := task.Context()
+
+		b.connMu.RLock()
+		p := b.pickConnPool()
+		b.connMu.RUnlock()
+
+		if p == nil {
+			b.trySendError(task, ErrNoPoolsAvailable)
+
+			continue
+		}
+
+		var wr PoolItem
+		var err error
+		if taskCtx != nil {
+			wr, err = p.GetWithContext(taskCtx)
+		} else {
+			wr, err = p.Get()
+		}
+
+		if err != nil {
+			if taskCtx != nil && errors.Is(err, taskCtx.Err()) {
+				continue
+			}
+			b.trySendError(task, fmt.Errorf("failed to get connection: %w", err))
+
+			continue
+		}
+
+		err = b.handleConnection(task, wr)
+		if err != nil {
+			p.Release(wr)
+
+			continue
+		}
+
+		p.Put(wr)
 	}
 }
 
@@ -539,4 +460,12 @@ func (b *broker) addTask(task *Task) []byte {
 	copy(cmd[taskIDSize:], *task.request)
 
 	return cmd
+}
+
+// Close shuts down the broker, cancelling context and waiting for workers to exit.
+func (b *broker) Close() {
+	// cancel broker context to stop workers
+	b.cancel()
+	// wait for all worker goroutines to finish
+	b.wg.Wait()
 }

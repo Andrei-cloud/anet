@@ -9,9 +9,15 @@ import (
 	"github.com/andrei-cloud/anet"
 )
 
-var frameBufferPool = sync.Pool{
-	New: func() any { return make([]byte, 0, 4096) },
-} // pool for message frames.
+// placeholder buffer pools (NUMA stub): one pool of 8KB capacity.
+var numaPools = []*sync.Pool{
+	{New: func() any { return make([]byte, 0, 8192) }},
+}
+
+// getLocalPool returns the pool for message frames.
+func getLocalPool() *sync.Pool {
+	return numaPools[0]
+}
 
 type Server struct {
 	address     string         // network address to listen on.
@@ -200,7 +206,7 @@ func (s *Server) dispatchMessage(sc *ServerConn, taskID []byte, request []byte) 
 		}
 
 		// reuse buffer for taskID+resp to reduce allocations.
-		buf := frameBufferPool.Get().([]byte)
+		buf := getLocalPool().Get().([]byte)
 		required := len(taskID) + len(resp)
 		if cap(buf) < required {
 			buf = make([]byte, required)
@@ -220,7 +226,7 @@ func (s *Server) dispatchMessage(sc *ServerConn, taskID []byte, request []byte) 
 		sc.writeMu.Unlock()
 
 		// return buffer to pool.
-		frameBufferPool.Put(buf[:0])
+		getLocalPool().Put(buf[:0])
 
 		if writeErr != nil {
 			s.logf("write error: %v", writeErr)
