@@ -2,6 +2,7 @@ package anet
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -139,7 +140,7 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 
 		return nil, ErrClosingBroker
 	}
-	b.pending.Store(string(task.taskID), task)
+	b.pending.Store(task.id, task)
 	b.mu.Unlock()
 
 	// enqueue without blocking; fail if broker closing or queue full
@@ -169,7 +170,7 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 
 		return nil, ErrClosingBroker
 	}
-	b.pending.Store(string(task.taskID), task)
+	b.pending.Store(task.id, task)
 	b.mu.Unlock()
 
 	// enqueue without blocking; handle context and broker closing
@@ -299,12 +300,12 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 	}
 
 	b.connMu.Lock()
-	b.activeConns.Store(string(task.taskID), netConn)
+	b.activeConns.Store(task.id, netConn)
 	b.connMu.Unlock()
 
 	defer func() {
 		b.connMu.Lock()
-		b.activeConns.Delete(string(task.taskID))
+		b.activeConns.Delete(task.id)
 		b.connMu.Unlock()
 	}()
 
@@ -404,7 +405,7 @@ func (b *broker) respondPending(resp []byte) {
 	if len(resp) < taskIDSize {
 		return
 	}
-	taskID := string(resp[:taskIDSize])
+	taskID := binary.BigEndian.Uint32(resp[:taskIDSize])
 
 	if value, ok := b.pending.Load(taskID); ok {
 		task, castOK := value.(*Task)
@@ -430,7 +431,7 @@ func (b *broker) respondPending(resp []byte) {
 }
 
 func (b *broker) failPending(task *Task) {
-	b.pending.Delete(string(task.taskID))
+	b.pending.Delete(task.id)
 	func() {
 		defer func() { _ = recover() }()
 		close(task.response)
@@ -439,13 +440,13 @@ func (b *broker) failPending(task *Task) {
 }
 
 func (b *broker) newTask(ctx context.Context, r *[]byte) *Task {
+	// assign unique integer ID and encode into 4-byte header
+	id := atomic.AddUint32(&nextTaskID, 1)
 	taskIDBytes := make([]byte, taskIDSize)
-	b.mu.Lock()
-	_, _ = b.rng.Read(taskIDBytes)
-	b.mu.Unlock()
-
+	binary.BigEndian.PutUint32(taskIDBytes, id)
 	return &Task{
 		ctx:      ctx,
+		id:       id,
 		taskID:   taskIDBytes,
 		request:  r,
 		response: make(chan []byte, 1),

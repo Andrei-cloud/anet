@@ -14,13 +14,17 @@ const (
 	taskIDSize = 4
 )
 
+// nextTaskID is the global atomic counter for assigning unique task IDs.
+var nextTaskID uint32
+
 // Task represents a single request/response operation managed by the broker.
 // Each task has a unique ID that is prepended to the request message and
 // must be included at the start of the response for proper correlation.
 type Task struct {
 	//nolint:containedctx // Necessary for task cancellation within broker queue.
 	ctx       context.Context // Context for cancellation and timeouts
-	taskID    []byte          // Unique identifier for request/response correlation
+	id        uint32          // integer identifier for request/response correlation
+	taskID    []byte          // Unique identifier bytes for framing (big-endian uint32)
 	request   *[]byte         // Request payload to be sent
 	response  chan []byte     // Channel for receiving the response
 	errCh     chan error      // Channel for receiving errors
