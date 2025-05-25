@@ -95,7 +95,16 @@ func newBroker(addr string) anet.Broker {
 	logger := &loggerWrapper{
 		Logger: log.New(os.Stdout, "BROKER: ", log.LstdFlags|log.Lmicroseconds),
 	}
-	broker := anet.NewBroker(pools, numWorkers, logger, nil)
+
+	// Enable memory optimizations for better performance
+	config := &anet.BrokerConfig{
+		WriteTimeout:   5 * time.Second,
+		ReadTimeout:    5 * time.Second,
+		QueueSize:      1000,
+		OptimizeMemory: true, // Enable memory optimizations
+	}
+
+	broker := anet.NewBroker(pools, numWorkers, logger, config)
 
 	go func() {
 		if err := broker.Start(); err != nil && err != anet.ErrQuit {

@@ -18,6 +18,12 @@ type globalBufferPoolType struct {
 	nodes int           // number of NUMA nodes detected
 }
 
+// bufferPool manages a set of sync.Pool instances for different buffer sizes.
+// This helps reduce memory allocations and GC pressure by reusing buffers.
+type bufferPool struct {
+	pools []*sync.Pool // Array of pools for different size classes
+}
+
 // newGlobalBufferPool creates a NUMA-aware global buffer pool.
 func newGlobalBufferPool() *globalBufferPoolType {
 	nodes := detectNUMANodes()
@@ -25,18 +31,13 @@ func newGlobalBufferPool() *globalBufferPoolType {
 	for i := 0; i < nodes; i++ {
 		pools[i] = newBufferPool()
 	}
+
 	return &globalBufferPoolType{pools: pools, nodes: nodes}
 }
 
 // detectNUMANodes returns the number of NUMA nodes on this system. Defaults to 1.
 func detectNUMANodes() int {
 	return 1 // stub: real detection can be added via cgo or syscalls
-}
-
-// bufferPool manages a set of sync.Pool instances for different buffer sizes.
-// This helps reduce memory allocations and GC pressure by reusing buffers.
-type bufferPool struct {
-	pools []*sync.Pool // Array of pools for different size classes
 }
 
 // newBufferPool creates a new buffer pool with pre-allocated sync.Pool instances
@@ -103,7 +104,7 @@ func (bp *bufferPool) putBuffer(buf []byte) {
 		poolIdx++
 	}
 
-	//nolint:staticcheck // passing slice which is pointer-like
+	//nolint:staticcheck // SA6002: passing buf by value is necessary for the pool.
 	bp.pools[poolIdx].Put(buf)
 }
 

@@ -14,20 +14,21 @@ var numaPools = []*sync.Pool{
 	{New: func() any { return make([]byte, 0, 8192) }},
 }
 
+type Server struct {
+	address         string                 // network address to listen on.
+	listener        net.Listener           // TCP listener for incoming connections.
+	config          *ServerConfig          // server configuration options.
+	handler         Handler                // handler to process incoming messages.
+	activeConns     sync.Map               // registry of active connections.
+	connWG          sync.WaitGroup         // tracks active connection goroutines.
+	stopChan        chan struct{}          // signals server shutdown.
+	mu              sync.Mutex             // protects server internal state.
+	responseBuffers *responseBufferManager // manages response buffers.
+}
+
 // getLocalPool returns the pool for message frames.
 func getLocalPool() *sync.Pool {
 	return numaPools[0]
-}
-
-type Server struct {
-	address     string         // network address to listen on.
-	listener    net.Listener   // TCP listener for incoming connections.
-	config      *ServerConfig  // server configuration options.
-	handler     Handler        // handler to process incoming messages.
-	activeConns sync.Map       // registry of active connections.
-	connWG      sync.WaitGroup // tracks active connection goroutines.
-	stopChan    chan struct{}  // signals server shutdown.
-	mu          sync.Mutex     // protects server internal state.
 }
 
 func NewServer(address string, handler Handler, config *ServerConfig) (*Server, error) {
@@ -40,10 +41,11 @@ func NewServer(address string, handler Handler, config *ServerConfig) (*Server, 
 	config.applyDefaults()
 
 	return &Server{
-		address:  address,
-		config:   config,
-		handler:  handler,
-		stopChan: make(chan struct{}),
+		address:         address,
+		config:          config,
+		handler:         handler,
+		stopChan:        make(chan struct{}),
+		responseBuffers: newResponseBufferManager(),
 	}, nil
 }
 
@@ -194,7 +196,7 @@ func (s *Server) connectionLoop(sc *ServerConn) {
 	}
 }
 
-func (s *Server) dispatchMessage(sc *ServerConn, taskID []byte, request []byte) {
+func (s *Server) dispatchMessage(sc *ServerConn, taskID, request []byte) {
 	go func() {
 		resp, err := s.handler.HandleMessage(sc, request)
 		if err != nil {
@@ -206,7 +208,12 @@ func (s *Server) dispatchMessage(sc *ServerConn, taskID []byte, request []byte) 
 		}
 
 		// reuse buffer for taskID+resp to reduce allocations.
-		buf := getLocalPool().Get().([]byte)
+		//nolint:errcheck // sync.Pool.Get() doesn't return an error
+		obj := getLocalPool().Get()
+		buf, ok := obj.([]byte)
+		if !ok {
+			buf = make([]byte, 0, 8192)
+		}
 		required := len(taskID) + len(resp)
 		if cap(buf) < required {
 			buf = make([]byte, required)
@@ -226,6 +233,7 @@ func (s *Server) dispatchMessage(sc *ServerConn, taskID []byte, request []byte) 
 		sc.writeMu.Unlock()
 
 		// return buffer to pool.
+		//nolint:staticcheck // passing slice which is pointer-like
 		getLocalPool().Put(buf[:0])
 
 		if writeErr != nil {

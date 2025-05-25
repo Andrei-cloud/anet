@@ -10,10 +10,12 @@ func nextPow2(v int) int {
 	for res < v {
 		res <<= 1
 	}
+
 	return res
 }
 
 func TestGetBufferBasic(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		size        int
 		expectedCap int
@@ -40,6 +42,7 @@ func TestGetBufferBasic(t *testing.T) {
 }
 
 func TestGetBufferLarge(t *testing.T) {
+	t.Parallel()
 	// request size > maxBufferSize should allocate exact size
 	large := maxBufferSize*2 + 1
 	buf := globalBufferPool.getBuffer(large)

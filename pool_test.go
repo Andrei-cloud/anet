@@ -1,4 +1,3 @@
-//nolint:all
 package anet_test
 
 import (
@@ -16,12 +15,15 @@ import (
 )
 
 func TestPool(t *testing.T) {
+	t.Parallel()
 	// Create a shared server for all pool tests
 	addr, stop, err := StartTestServer()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer stop() // stop server after all subtests complete
+	defer func() {
+		_ = stop() // stop server after all subtests complete
+	}()
 
 	// Sleep to ensure the server is fully ready
 	time.Sleep(50 * time.Millisecond)
@@ -35,7 +37,8 @@ func TestPool(t *testing.T) {
 
 		// Set read/write deadlines to avoid hanging
 		if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
-			conn.Close()
+			_ = conn.Close()
+
 			return nil, fmt.Errorf("failed to set deadline: %w", err)
 		}
 
@@ -43,6 +46,7 @@ func TestPool(t *testing.T) {
 	}
 
 	t.Run("NewPool", func(t *testing.T) {
+		t.Parallel()
 		// sequential subtest, no t.Parallel()
 		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
@@ -50,6 +54,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("Get Len Put", func(t *testing.T) {
+		t.Parallel()
 		// sequential subtest, no t.Parallel()
 		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
@@ -60,6 +65,7 @@ func TestPool(t *testing.T) {
 		item, err := p.Get()
 		if err != nil {
 			t.Skipf("Skipping test due to connection error: %v", err)
+
 			return
 		}
 		require.Equal(t, 1, p.Len())
@@ -69,6 +75,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("Get on closed", func(t *testing.T) {
+		t.Parallel()
 		// sequential subtest, no t.Parallel()
 		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
@@ -82,6 +89,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("GetWithContext", func(t *testing.T) {
+		t.Parallel()
 		// sequential subtest, no t.Parallel()
 		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
@@ -92,6 +100,7 @@ func TestPool(t *testing.T) {
 		item, err := p.GetWithContext(ctx)
 		if err != nil {
 			t.Skipf("Skipping test due to connection error: %v", err)
+
 			return
 		}
 		require.NotNil(t, item)
@@ -104,6 +113,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("Release", func(t *testing.T) {
+		t.Parallel()
 		// sequential subtest, no t.Parallel()
 		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
@@ -112,6 +122,7 @@ func TestPool(t *testing.T) {
 		item, err := p.Get()
 		if err != nil {
 			t.Skipf("Skipping test due to connection error: %v", err)
+
 			return
 		}
 		require.NotNil(t, item)
@@ -122,6 +133,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("Cap", func(t *testing.T) {
+		t.Parallel()
 		// sequential subtest, no t.Parallel()
 		p := anet.NewPool(5, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
@@ -130,6 +142,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("Factory Error", func(t *testing.T) {
+		t.Parallel()
 		// sequential subtest, no t.Parallel()
 
 		errorFactory := func(_ string) (anet.PoolItem, error) {
@@ -146,6 +159,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("GetWithContext Factory Error", func(t *testing.T) {
+		t.Parallel()
 		// sequential subtest, no t.Parallel()
 
 		errorFactory := func(_ string) (anet.PoolItem, error) {
@@ -164,6 +178,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("Put on closed", func(t *testing.T) {
+		t.Parallel()
 		// sequential subtest, no t.Parallel()
 		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
@@ -171,6 +186,7 @@ func TestPool(t *testing.T) {
 		item, err := p.Get()
 		if err != nil {
 			t.Skipf("Skipping test due to connection error: %v", err)
+
 			return
 		}
 		require.NotNil(t, item)
@@ -183,6 +199,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("Release nil", func(t *testing.T) {
+		t.Parallel()
 		// sequential subtest, no t.Parallel()
 		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(t, p)
@@ -192,6 +209,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("NewPoolList", func(t *testing.T) {
+		t.Parallel()
 		// sequential subtest, no t.Parallel()
 
 		addrs := []string{addr, addr}
@@ -205,6 +223,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("Concurrent Access", func(t *testing.T) {
+		t.Parallel()
 		// sequential subtest, no t.Parallel()
 
 		// Create a pool with increased capacity for concurrent access
@@ -238,7 +257,7 @@ func TestPool(t *testing.T) {
 					// Check if test context is done
 					select {
 					case <-ctx.Done():
-						errChan <- fmt.Errorf("goroutine %d: test context cancelled: %w", id, ctx.Err())
+						errChan <- fmt.Errorf("goroutine %d: test context canceled: %w", id, ctx.Err())
 						return
 					default:
 						// Proceed with normal operation
@@ -258,6 +277,7 @@ func TestPool(t *testing.T) {
 								// Only report non-timeout, non-connection errors
 								errChan <- fmt.Errorf("goroutine %d: Get error on iteration %d: %w", id, j, err)
 							}
+
 							continue
 						}
 
@@ -283,6 +303,7 @@ func TestPool(t *testing.T) {
 								// Only report non-timeout, non-connection errors
 								errChan <- fmt.Errorf("goroutine %d: GetWithContext error on iteration %d: %w", id, j, err)
 							}
+
 							continue
 						}
 
@@ -302,6 +323,7 @@ func TestPool(t *testing.T) {
 								// Only report non-timeout, non-connection errors
 								errChan <- fmt.Errorf("goroutine %d: Get error on iteration %d: %w", id, j, err)
 							}
+
 							continue
 						}
 
@@ -358,12 +380,14 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("Get With Invalid Connection", func(t *testing.T) {
+		t.Parallel()
 		// Create a factory that returns an invalid connection
-		invalidFactory := func(addr string) (anet.PoolItem, error) {
+		invalidFactory := func(_ string) (anet.PoolItem, error) {
 			conn, err := net.DialTimeout("tcp", "localhost:1", 500*time.Millisecond)
 			if err != nil {
 				return nil, err
 			}
+
 			return conn, nil
 		}
 
@@ -378,6 +402,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("validateIdleConnections", func(t *testing.T) {
+		t.Parallel()
 		config := &anet.PoolConfig{
 			ValidationInterval: 100 * time.Millisecond,
 		}
@@ -404,7 +429,7 @@ func TestPool(t *testing.T) {
 
 		// Make one connection invalid
 		if conn, ok := item1.(net.Conn); ok {
-			conn.Close()
+			_ = conn.Close()
 		}
 
 		// Wait for validation to run
@@ -415,6 +440,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("Release Invalid Connection", func(t *testing.T) {
+		t.Parallel()
 		p := anet.NewPool(1, factory, addr, nil)
 		require.NotNil(t, p)
 		defer p.Close()
@@ -427,7 +453,7 @@ func TestPool(t *testing.T) {
 
 		// Make connection invalid
 		if conn, ok := item.(net.Conn); ok {
-			conn.Close()
+			_ = conn.Close()
 		}
 
 		// Release should handle invalid connection gracefully
@@ -436,6 +462,7 @@ func TestPool(t *testing.T) {
 	})
 
 	t.Run("GetWithContext Pool Full", func(t *testing.T) {
+		t.Parallel()
 		p := anet.NewPool(1, factory, addr, nil)
 		require.NotNil(t, p)
 		defer p.Close()
