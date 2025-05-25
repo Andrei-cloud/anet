@@ -36,6 +36,9 @@ type BrokerConfig struct {
 	ReadTimeout time.Duration
 	// QueueSize is the size of the request queue. Default is 1000.
 	QueueSize int
+	// OptimizeMemory enables memory optimization features like task ID pooling.
+	// When enabled, reduces allocations and improves performance. Default is false.
+	OptimizeMemory bool
 }
 
 // Broker coordinates sending requests and receiving responses over pooled connections.
@@ -71,7 +74,6 @@ type broker struct {
 	rng     *rand.Rand
 	wg      sync.WaitGroup
 	closing atomic.Bool
-	started atomic.Bool
 	config  *BrokerConfig
 }
 
@@ -81,9 +83,10 @@ type NoopLogger struct{}
 // DefaultBrokerConfig returns the default broker configuration.
 func DefaultBrokerConfig() *BrokerConfig {
 	return &BrokerConfig{
-		WriteTimeout: 5 * time.Second,
-		ReadTimeout:  5 * time.Second,
-		QueueSize:    1000,
+		WriteTimeout:   5 * time.Second,
+		ReadTimeout:    5 * time.Second,
+		QueueSize:      1000,
+		OptimizeMemory: true, // Memory optimization enabled by default.
 	}
 }
 
@@ -124,6 +127,7 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 	for _, p := range b.compool {
 		if p.Len() < p.Cap() {
 			allUsed = false
+
 			break
 		}
 	}
@@ -347,6 +351,7 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 			if err != nil {
 				readErr = fmt.Errorf("reading from connection: %w", err)
 				b.trySendError(task, readErr)
+
 				return
 			}
 			b.respondPending(resp)
@@ -411,6 +416,7 @@ func (b *broker) respondPending(resp []byte) {
 		task, castOK := value.(*Task)
 		if !castOK {
 			b.pending.Delete(taskID)
+
 			return
 		}
 
@@ -426,12 +432,23 @@ func (b *broker) respondPending(resp []byte) {
 
 		if sent {
 			b.pending.Delete(taskID)
+
+			// Return task ID to pool if optimization is enabled.
+			if task.optimized {
+				globalTaskIDPool.putTaskID(task.taskID)
+			}
 		}
 	}
 }
 
 func (b *broker) failPending(task *Task) {
 	b.pending.Delete(task.id)
+
+	// Return task ID to pool if optimization is enabled.
+	if task.optimized {
+		globalTaskIDPool.putTaskID(task.taskID)
+	}
+
 	func() {
 		defer func() { _ = recover() }()
 		close(task.response)
@@ -442,16 +459,26 @@ func (b *broker) failPending(task *Task) {
 func (b *broker) newTask(ctx context.Context, r *[]byte) *Task {
 	// assign unique integer ID and encode into 4-byte header
 	id := atomic.AddUint32(&nextTaskID, 1)
-	taskIDBytes := make([]byte, taskIDSize)
+
+	// Use optimized task ID allocation if available
+	var taskIDBytes []byte
+	if b.config != nil && b.config.OptimizeMemory {
+		taskIDBytes = globalTaskIDPool.getTaskID()
+	} else {
+		taskIDBytes = make([]byte, taskIDSize)
+	}
+
 	binary.BigEndian.PutUint32(taskIDBytes, id)
+
 	return &Task{
-		ctx:      ctx,
-		id:       id,
-		taskID:   taskIDBytes,
-		request:  r,
-		response: make(chan []byte, 1),
-		errCh:    make(chan error, 1),
-		created:  time.Now(),
+		ctx:       ctx,
+		id:        id,
+		taskID:    taskIDBytes,
+		request:   r,
+		response:  make(chan []byte, 1),
+		errCh:     make(chan error, 1),
+		created:   time.Now(),
+		optimized: b.config != nil && b.config.OptimizeMemory,
 	}
 }
 
@@ -463,7 +490,7 @@ func (b *broker) addTask(task *Task) []byte {
 	return cmd
 }
 
-// Close shuts down the broker, cancelling context and waiting for workers to exit.
+// Close shuts down the broker, canceling context and waiting for workers to exit.
 func (b *broker) Close() {
 	// cancel broker context to stop workers
 	b.cancel()

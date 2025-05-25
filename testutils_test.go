@@ -1,6 +1,5 @@
 // Package anet_test provides tests for the anet package.
-//
-//nolint:all
+
 package anet_test
 
 import (
@@ -93,6 +92,7 @@ func StartTestServer() (string, func() error, error) {
 						continue
 					}
 					log.Printf("Test server accept error: %v", err)
+
 					continue
 				}
 
@@ -115,6 +115,7 @@ func StartTestServer() (string, func() error, error) {
 							if !errors.Is(err, net.ErrClosed) {
 								log.Printf("Test server set read deadline error: %v", err)
 							}
+
 							return
 						}
 
@@ -124,6 +125,7 @@ func StartTestServer() (string, func() error, error) {
 							if err != io.EOF && !errors.Is(err, net.ErrClosed) {
 								log.Printf("Test server read error: %v", err)
 							}
+
 							return
 						}
 
@@ -132,6 +134,7 @@ func StartTestServer() (string, func() error, error) {
 							if !errors.Is(err, net.ErrClosed) {
 								log.Printf("Test server set write deadline error: %v", err)
 							}
+
 							return
 						}
 
@@ -141,6 +144,7 @@ func StartTestServer() (string, func() error, error) {
 							if !errors.Is(err, net.ErrClosed) {
 								log.Printf("Test server write error: %v", err)
 							}
+
 							return
 						}
 
@@ -149,6 +153,7 @@ func StartTestServer() (string, func() error, error) {
 							if !errors.Is(err, net.ErrClosed) {
 								log.Printf("Test server clear deadline error: %v", err)
 							}
+
 							return
 						}
 
