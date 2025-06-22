@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -15,9 +14,6 @@ import (
 )
 
 var (
-	// ErrTimeout indicates a response was not received within the deadline.
-	ErrTimeout = errors.New("timeout on response")
-
 	// ErrQuit indicates the broker is shutting down normally.
 	ErrQuit = errors.New("broker is quitting")
 
@@ -69,7 +65,6 @@ type broker struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	logger   Logger
-	rng      *rand.Rand
 	wg       sync.WaitGroup
 	closing  atomic.Bool
 	config   *BrokerConfig
@@ -106,8 +101,6 @@ func NewBroker(p []Pool, n int, l Logger, config *BrokerConfig) Broker {
 	if config == nil {
 		config = DefaultBrokerConfig()
 	}
-	rngSource := rand.NewSource(time.Now().UnixNano())
-	rng := rand.New(rngSource)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	b := &broker{
@@ -117,7 +110,6 @@ func NewBroker(p []Pool, n int, l Logger, config *BrokerConfig) Broker {
 		ctx:          ctx,
 		cancel:       cancel,
 		logger:       l,
-		rng:          rng,
 		config:       config,
 	}
 
@@ -154,7 +146,8 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 		return nil, ErrClosingBroker
 	}
 	// Use nil context for Send to avoid allocation overhead
-	task := b.newTask(nil, req)
+	// Use nil context for Send to avoid allocation overhead - safe since Send doesn't use context
+	task := b.newTask(nil, req) //nolint:staticcheck
 	if b.closing.Load() {
 		return nil, ErrClosingBroker
 	}
@@ -398,10 +391,6 @@ func (b *broker) pickConnPool() Pool {
 	return b.compool[idx]
 }
 
-func (b *broker) activePool() []Pool {
-	return b.compool
-}
-
 func (b *broker) trySendError(task *Task, err error) {
 	defer func() { _ = recover() }()
 	select {
@@ -521,7 +510,6 @@ func (b *broker) newTask(ctx context.Context, r *[]byte) *Task {
 		request:   r,
 		response:  respCh,
 		errCh:     errCh,
-		created:   time.Now(),
 		optimized: b.config != nil && b.config.OptimizeMemory,
 		pooled:    true, // Mark as using pools for cleanup
 	}

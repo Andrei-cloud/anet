@@ -15,15 +15,13 @@ var numaPools = []*sync.Pool{
 }
 
 type Server struct {
-	address         string                 // network address to listen on.
-	listener        net.Listener           // TCP listener for incoming connections.
-	config          *ServerConfig          // server configuration options.
-	handler         Handler                // handler to process incoming messages.
-	activeConns     sync.Map               // registry of active connections.
-	connWG          sync.WaitGroup         // tracks active connection goroutines.
-	stopChan        chan struct{}          // signals server shutdown.
-	mu              sync.Mutex             // protects server internal state.
-	responseBuffers *responseBufferManager // manages response buffers.
+	address     string         // network address to listen on.
+	listener    net.Listener   // TCP listener for incoming connections.
+	config      *ServerConfig  // server configuration options.
+	handler     Handler        // handler to process incoming messages.
+	activeConns sync.Map       // registry of active connections.
+	connWG      sync.WaitGroup // tracks active connection goroutines.
+	stopChan    chan struct{}  // signals server shutdown.
 }
 
 // getLocalPool returns the pool for message frames.
@@ -41,11 +39,10 @@ func NewServer(address string, handler Handler, config *ServerConfig) (*Server, 
 	config.applyDefaults()
 
 	return &Server{
-		address:         address,
-		config:          config,
-		handler:         handler,
-		stopChan:        make(chan struct{}),
-		responseBuffers: newResponseBufferManager(),
+		address:  address,
+		config:   config,
+		handler:  handler,
+		stopChan: make(chan struct{}),
 	}, nil
 }
 

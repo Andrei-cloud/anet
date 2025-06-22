@@ -15,9 +15,6 @@ import (
 	"github.com/andrei-cloud/anet/server"
 )
 
-// taskIDSize is the size in bytes of the task ID header used by the broker.
-const taskIDSize = 4
-
 // loggerWrapper adapts the standard log.Logger to satisfy anet.Logger interface.
 type loggerWrapper struct {
 	*log.Logger

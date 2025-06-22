@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -47,7 +45,6 @@ type Factory func(string) (PoolItem, error)
 
 // pool implements the Pool interface.
 type pool struct {
-	mu          sync.RWMutex
 	addr        string
 	capacity    uint32
 	count       atomic.Uint32
@@ -105,25 +102,6 @@ func NewPool(poolCap uint32, f Factory, addr string, config *PoolConfig) Pool {
 	}
 
 	return p
-}
-
-// validateConnection performs lightweight connection health check.
-func (p *pool) validateConnection(item PoolItem) bool {
-	if item == nil {
-		return false
-	}
-
-	// For network connections, just check if it's not nil and not closed
-	if conn, ok := item.(net.Conn); ok {
-		if conn == nil {
-			return false
-		}
-		// Avoid expensive TCP operations in the hot path
-		// Just return true - let actual usage detect broken connections
-		return true
-	}
-
-	return true
 }
 
 // validateIdleConnections periodically validates idle connections - simplified.

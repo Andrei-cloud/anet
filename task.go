@@ -2,8 +2,6 @@ package anet
 
 import (
 	"context"
-	"encoding/hex"
-	"time"
 )
 
 // Constants for task management.
@@ -36,7 +34,6 @@ type Task struct {
 	request   *[]byte         // Request payload to be sent
 	response  chan []byte     // Channel for receiving the response
 	errCh     chan error      // Channel for receiving errors
-	created   time.Time       // Creation timestamp for monitoring
 	optimized bool            // Tracks whether task uses pooled memory (for cleanup)
 	pooled    bool            // Tracks whether task struct and channels are pooled
 }
@@ -83,22 +80,4 @@ func (tp *taskIDPool) putTaskID(taskID []byte) {
 // when using SendContext.
 func (t *Task) Context() context.Context {
 	return t.ctx
-}
-
-// ID returns the task's unique ID as a hexadecimal string.
-// This is useful for logging and debugging request/response flows.
-func (t *Task) ID() string {
-	return hex.EncodeToString(t.taskID)
-}
-
-// Created returns the task creation time.
-// This can be used to monitor request latency and detect stale tasks.
-func (t *Task) Created() time.Time {
-	return t.created
-}
-
-// Request returns the request payload.
-// The broker will prepend the task ID to this payload before sending.
-func (t *Task) Request() *[]byte {
-	return t.request
 }
