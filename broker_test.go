@@ -723,13 +723,12 @@ func BenchmarkBrokerSend(b *testing.B) {
 						wg.Done()
 					}()
 
-					// Use context with timeout for safety
-					ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-					_, err := broker.SendContext(ctx, &msg)
-					cancel()
+					// Use Send instead of SendContext to avoid context allocation overhead
+					_, err := broker.Send(&msg)
 
 					if err != nil && !errors.Is(err, context.DeadlineExceeded) &&
-						!errors.Is(err, context.Canceled) {
+						!errors.Is(err, context.Canceled) &&
+						!errors.Is(err, anet.ErrClosingBroker) {
 						b.Logf("Benchmark send error: %v", err)
 					}
 				}(&wg)

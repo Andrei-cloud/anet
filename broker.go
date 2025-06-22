@@ -66,14 +66,17 @@ type broker struct {
 	pending      sync.Map
 	activeConns  sync.Map
 	//nolint:containedctx // Necessary for task cancellation within broker queue.
-	ctx     context.Context
-	cancel  context.CancelFunc
-	logger  Logger
-	rng     *rand.Rand
-	wg      sync.WaitGroup
-	closing atomic.Bool
-	config  *BrokerConfig
-	poolIdx atomic.Uint32 // atomic pool selection index
+	ctx      context.Context
+	cancel   context.CancelFunc
+	logger   Logger
+	rng      *rand.Rand
+	wg       sync.WaitGroup
+	closing  atomic.Bool
+	config   *BrokerConfig
+	poolIdx  atomic.Uint32 // atomic pool selection index
+	taskPool sync.Pool     // Pool for Task structs
+	respPool sync.Pool     // Pool for response channels
+	errPool  sync.Pool     // Pool for error channels
 }
 
 // NoopLogger provides a default no-op logger.
@@ -107,7 +110,7 @@ func NewBroker(p []Pool, n int, l Logger, config *BrokerConfig) Broker {
 	rng := rand.New(rngSource)
 	ctx, cancel := context.WithCancel(context.Background())
 
-	return &broker{
+	b := &broker{
 		workers:      n,
 		compool:      p,
 		requestQueue: make(chan *Task, config.QueueSize), // Buffered channel for efficient queuing
@@ -117,6 +120,25 @@ func NewBroker(p []Pool, n int, l Logger, config *BrokerConfig) Broker {
 		rng:          rng,
 		config:       config,
 	}
+
+	// Initialize object pools for memory optimization
+	b.taskPool = sync.Pool{
+		New: func() any {
+			return &Task{}
+		},
+	}
+	b.respPool = sync.Pool{
+		New: func() any {
+			return make(chan []byte, 1)
+		},
+	}
+	b.errPool = sync.Pool{
+		New: func() any {
+			return make(chan error, 1)
+		},
+	}
+
+	return b
 }
 
 // Send sends a request and waits for the response.
@@ -131,7 +153,8 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 	if allUsed {
 		return nil, ErrClosingBroker
 	}
-	task := b.newTask(context.Background(), req)
+	// Use nil context for Send to avoid allocation overhead
+	task := b.newTask(nil, req)
 	if b.closing.Load() {
 		return nil, ErrClosingBroker
 	}
@@ -416,6 +439,18 @@ func (b *broker) respondPending(resp []byte) {
 			if task.optimized {
 				globalTaskIDPool.putTaskID(task.taskID)
 			}
+			// Return successful tasks to pool as well
+			if task.pooled {
+				// Don't close channels for successful response, just return to pool
+				go func() {
+					// Wait briefly to ensure response was read, then return to pool
+					select {
+					case <-task.response:
+					case <-time.After(time.Millisecond):
+					}
+					b.returnTaskToPool(task)
+				}()
+			}
 		}
 	}
 }
@@ -430,6 +465,33 @@ func (b *broker) failPending(task *Task) {
 		close(task.response)
 		close(task.errCh)
 	}()
+
+	// Return pooled objects to reduce memory pressure
+	if task.pooled {
+		b.returnTaskToPool(task)
+	}
+}
+
+// returnTaskToPool returns a Task and its channels back to the pools
+func (b *broker) returnTaskToPool(task *Task) {
+	// Clear sensitive data
+	respCh := task.response
+	errCh := task.errCh
+
+	// Drain channels before returning to pool
+	select {
+	case <-respCh:
+	default:
+	}
+	select {
+	case <-errCh:
+	default:
+	}
+
+	// Return to pools
+	b.respPool.Put(respCh)
+	b.errPool.Put(errCh)
+	b.taskPool.Put(task)
 }
 
 func (b *broker) newTask(ctx context.Context, r *[]byte) *Task {
@@ -446,20 +508,36 @@ func (b *broker) newTask(ctx context.Context, r *[]byte) *Task {
 
 	binary.BigEndian.PutUint32(taskIDBytes, id)
 
-	return &Task{
+	// Get pooled Task struct and channels to reduce allocations
+	task := b.taskPool.Get().(*Task)
+	respCh := b.respPool.Get().(chan []byte)
+	errCh := b.errPool.Get().(chan error)
+
+	// Reset and initialize the task
+	*task = Task{
 		ctx:       ctx,
 		id:        id,
 		taskID:    taskIDBytes,
 		request:   r,
-		response:  make(chan []byte, 1),
-		errCh:     make(chan error, 1),
+		response:  respCh,
+		errCh:     errCh,
 		created:   time.Now(),
 		optimized: b.config != nil && b.config.OptimizeMemory,
+		pooled:    true, // Mark as using pools for cleanup
 	}
+
+	return task
 }
 
 func (b *broker) addTask(task *Task) []byte {
-	cmd := make([]byte, taskIDSize+len(*task.request))
+	totalSize := taskIDSize + len(*task.request)
+
+	// Use buffer pool for command allocation to reduce GC pressure
+	cmd := globalBufferPool.getBuffer(totalSize)
+	if len(cmd) > totalSize {
+		cmd = cmd[:totalSize] // Trim to exact size needed
+	}
+
 	copy(cmd[:taskIDSize], task.taskID)
 	copy(cmd[taskIDSize:], *task.request)
 

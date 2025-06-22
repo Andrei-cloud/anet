@@ -38,6 +38,7 @@ type Task struct {
 	errCh     chan error      // Channel for receiving errors
 	created   time.Time       // Creation timestamp for monitoring
 	optimized bool            // Tracks whether task uses pooled memory (for cleanup)
+	pooled    bool            // Tracks whether task struct and channels are pooled
 }
 
 // newTaskIDPool creates a new task ID pool with the specified size.
