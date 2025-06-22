@@ -75,6 +75,86 @@ func StartTestServer() (string, func() error, error) {
 	connSem := make(chan struct{}, maxConns)
 	var activeConnections sync.WaitGroup
 
+	// Extracted connection handler to reduce nesting
+	handleConn := func(conn net.Conn) {
+		var shouldBroadcast bool
+		defer func() {
+			_ = conn.Close()
+			<-connSem
+			activeConnections.Done()
+			// Only broadcast if we were at maxConns
+			if len(connSem) == maxConns-1 {
+				shouldBroadcast = true
+			}
+			if shouldBroadcast {
+				listenerCond.Broadcast()
+			}
+		}()
+
+		if tcpConn, ok := conn.(*net.TCPConn); ok {
+			_ = tcpConn.SetKeepAlive(true)
+			_ = tcpConn.SetKeepAlivePeriod(1 * time.Second)
+		}
+
+		for {
+			if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+				if logVerbose && !errors.Is(err, net.ErrClosed) {
+					log.Printf("Test server set read deadline error: %v", err)
+				}
+
+				return
+			}
+			requestMsg, err := anet.Read(conn)
+			if err != nil {
+				if err != io.EOF && !errors.Is(err, net.ErrClosed) {
+					if ne, ok := err.(net.Error); ok && ne.Temporary() {
+						if logVerbose {
+							log.Printf("Test server temporary read error: %v", err)
+						}
+
+						continue
+					}
+					if logVerbose {
+						log.Printf("Test server read error: %v", err)
+					}
+				}
+
+				return
+			}
+			if err := conn.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
+				if logVerbose && !errors.Is(err, net.ErrClosed) {
+					log.Printf("Test server set write deadline error: %v", err)
+				}
+
+				return
+			}
+			err = anet.Write(conn, requestMsg)
+			if err != nil {
+				if !errors.Is(err, net.ErrClosed) {
+					if ne, ok := err.(net.Error); ok && ne.Temporary() {
+						if logVerbose {
+							log.Printf("Test server temporary write error: %v", err)
+						}
+
+						continue
+					}
+					if logVerbose {
+						log.Printf("Test server write error: %v", err)
+					}
+				}
+
+				return
+			}
+			_ = conn.SetDeadline(time.Time{})
+			select {
+			case <-quit:
+				return
+			default:
+				continue
+			}
+		}
+	}
+
 	go func() {
 		close(ready)
 		acceptBackoff := 5 * time.Millisecond
@@ -103,15 +183,18 @@ func StartTestServer() (string, func() error, error) {
 							log.Printf("Test server listener closed.")
 						}
 						listenerCond.Broadcast()
+
 						return
 					} else if os.IsTimeout(err) {
 						acceptBackoff *= 2
+						//nolint: all // test package, so no need for error handling
 						if acceptBackoff > maxBackoff {
 							acceptBackoff = maxBackoff
 						}
 						listenerMu.Lock()
 						listenerCond.Wait()
 						listenerMu.Unlock()
+
 						continue
 					}
 					if ne, ok := err.(net.Error); ok && ne.Temporary() {
@@ -125,6 +208,7 @@ func StartTestServer() (string, func() error, error) {
 						listenerMu.Lock()
 						listenerCond.Wait()
 						listenerMu.Unlock()
+
 						continue
 					}
 					if logVerbose {
@@ -133,6 +217,7 @@ func StartTestServer() (string, func() error, error) {
 					listenerMu.Lock()
 					listenerCond.Wait()
 					listenerMu.Unlock()
+
 					continue
 				}
 				acceptBackoff = 5 * time.Millisecond // reset on success
@@ -147,78 +232,7 @@ func StartTestServer() (string, func() error, error) {
 				}
 
 				activeConnections.Add(1)
-				go func(conn net.Conn) {
-					var shouldBroadcast bool
-					defer func() {
-						_ = conn.Close()
-						<-connSem
-						activeConnections.Done()
-						// Only broadcast if we were at maxConns
-						if len(connSem) == maxConns-1 {
-							shouldBroadcast = true
-						}
-						if shouldBroadcast {
-							listenerCond.Broadcast()
-						}
-					}()
-
-					if tcpConn, ok := conn.(*net.TCPConn); ok {
-						_ = tcpConn.SetKeepAlive(true)
-						_ = tcpConn.SetKeepAlivePeriod(1 * time.Second)
-					}
-
-					for {
-						if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
-							if logVerbose && !errors.Is(err, net.ErrClosed) {
-								log.Printf("Test server set read deadline error: %v", err)
-							}
-							return
-						}
-						requestMsg, err := anet.Read(conn)
-						if err != nil {
-							if err != io.EOF && !errors.Is(err, net.ErrClosed) {
-								if ne, ok := err.(net.Error); ok && ne.Temporary() {
-									if logVerbose {
-										log.Printf("Test server temporary read error: %v", err)
-									}
-									continue
-								}
-								if logVerbose {
-									log.Printf("Test server read error: %v", err)
-								}
-							}
-							return
-						}
-						if err := conn.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
-							if logVerbose && !errors.Is(err, net.ErrClosed) {
-								log.Printf("Test server set write deadline error: %v", err)
-							}
-							return
-						}
-						err = anet.Write(conn, requestMsg)
-						if err != nil {
-							if !errors.Is(err, net.ErrClosed) {
-								if ne, ok := err.(net.Error); ok && ne.Temporary() {
-									if logVerbose {
-										log.Printf("Test server temporary write error: %v", err)
-									}
-									continue
-								}
-								if logVerbose {
-									log.Printf("Test server write error: %v", err)
-								}
-							}
-							return
-						}
-						_ = conn.SetDeadline(time.Time{})
-						select {
-						case <-quit:
-							return
-						default:
-							continue
-						}
-					}
-				}(conn)
+				go handleConn(conn)
 			}
 		}
 	}()
@@ -235,6 +249,7 @@ func StartTestServer() (string, func() error, error) {
 		if !waitGroupWithTimeout(&activeConnections, shutdownTimeout) {
 			log.Printf("Timed out waiting for test server connections to close")
 		}
+
 		return err
 	}, nil
 }

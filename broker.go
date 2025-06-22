@@ -145,9 +145,9 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 	if allUsed {
 		return nil, ErrClosingBroker
 	}
-	// Use nil context for Send to avoid allocation overhead
-	// Use nil context for Send to avoid allocation overhead - safe since Send doesn't use context
-	task := b.newTask(nil, req) //nolint:staticcheck
+	// Use context.TODO for Send to avoid allocation overhead
+	// Use context.TODO for Send to avoid allocation overhead - safe since Send doesn't use context
+	task := b.newTask(context.TODO(), req)
 	if b.closing.Load() {
 		return nil, ErrClosingBroker
 	}
@@ -192,6 +192,7 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+
 		return nil, ErrClosingBroker
 	}
 	select {
@@ -276,6 +277,7 @@ func (b *broker) loop(_ int) error {
 					continue
 				}
 				b.trySendError(task, fmt.Errorf("failed to get connection: %w", err))
+
 				continue
 			}
 
@@ -388,6 +390,7 @@ func (b *broker) pickConnPool() Pool {
 	}
 	// Atomic round-robin pool selection for better load distribution
 	idx := b.poolIdx.Add(1) % uint32(len(b.compool))
+
 	return b.compool[idx]
 }
 
@@ -461,7 +464,7 @@ func (b *broker) failPending(task *Task) {
 	}
 }
 
-// returnTaskToPool returns a Task and its channels back to the pools
+// returnTaskToPool returns a Task and its channels back to the pools.
 func (b *broker) returnTaskToPool(task *Task) {
 	// Clear sensitive data
 	respCh := task.response
@@ -498,9 +501,18 @@ func (b *broker) newTask(ctx context.Context, r *[]byte) *Task {
 	binary.BigEndian.PutUint32(taskIDBytes, id)
 
 	// Get pooled Task struct and channels to reduce allocations
-	task := b.taskPool.Get().(*Task)
-	respCh := b.respPool.Get().(chan []byte)
-	errCh := b.errPool.Get().(chan error)
+	task, ok := b.taskPool.Get().(*Task)
+	if !ok {
+		task = &Task{}
+	}
+	respCh, ok := b.respPool.Get().(chan []byte)
+	if !ok {
+		respCh = make(chan []byte, 1)
+	}
+	errCh, ok := b.errPool.Get().(chan error)
+	if !ok {
+		errCh = make(chan error, 1)
+	}
 
 	// Reset and initialize the task
 	*task = Task{

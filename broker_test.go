@@ -653,7 +653,7 @@ func BenchmarkBrokerSend(b *testing.B) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Use smaller worker counts for benchmarking to reduce resource contention
-	worker_counts := []int{1, 5, 10, 20}
+	worker_counts := []int{1, 5, 10, 20, 50, 100}
 
 	// Use a factory with proper timeouts to prevent hanging during benchmarks
 	factory := func(addr string) (anet.PoolItem, error) {

@@ -114,30 +114,42 @@ func (p *pool) validateIdleConnections() {
 		case <-p.stopChan:
 			return
 		case <-ticker.C:
-			// Check closing status without lock first
-			if p.closing.Load() {
-				return
-			}
-
-			// Only validate a small subset to avoid performance impact
-			maxToCheck := 5 // Limit validation to avoid overhead
-		checkLoop:
-			for i := 0; i < maxToCheck; i++ {
-				select {
-				case item := <-p.queue:
-					if item != nil {
-						// Just put it back - let usage detect broken connections
-						select {
-						case p.queue <- item:
-						default:
-							p.Release(item)
-						}
-					}
-				default:
-					break checkLoop
-				}
-			}
+			p.validateConnectionSubset()
 		}
+	}
+}
+
+// validateConnectionSubset validates a small subset of idle connections.
+func (p *pool) validateConnectionSubset() {
+	// Check closing status without lock first
+	if p.closing.Load() {
+		return
+	}
+
+	// Only validate a small subset to avoid performance impact
+	maxToCheck := 5 // Limit validation to avoid overhead
+checkLoop:
+	for i := 0; i < maxToCheck; i++ {
+		select {
+		case item := <-p.queue:
+			if item == nil {
+				continue
+			}
+			// Just put it back - let usage detect broken connections
+			p.returnOrRelease(item)
+		default:
+			break checkLoop
+		}
+	}
+}
+
+// returnOrRelease tries to return item to pool, releases if pool is full.
+func (p *pool) returnOrRelease(item PoolItem) {
+	select {
+	case p.queue <- item:
+		// Successfully returned to pool
+	default:
+		p.Release(item)
 	}
 }
 
@@ -154,6 +166,7 @@ func (p *pool) Get() (PoolItem, error) {
 			return nil, ErrClosing
 		}
 		// Skip validation in fast path - let actual usage detect issues
+
 		return item, nil
 	default:
 	}
@@ -167,6 +180,7 @@ func (p *pool) Get() (PoolItem, error) {
 				p.count.Add(^uint32(0))
 				return nil, err
 			}
+
 			return item, nil
 		}
 	}
@@ -192,6 +206,7 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 		if item == nil {
 			return nil, ErrClosing
 		}
+
 		return item, nil
 	default:
 	}
@@ -205,6 +220,7 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 				p.count.Add(^uint32(0))
 				return nil, err
 			}
+
 			return item, nil
 		}
 	}
@@ -215,6 +231,7 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 		if item == nil {
 			return nil, ErrClosing
 		}
+
 		return item, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
