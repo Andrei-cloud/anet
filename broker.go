@@ -60,11 +60,9 @@ type Logger interface {
 
 // broker implements the Broker interface.
 type broker struct {
-	mu           sync.Mutex
-	connMu       sync.RWMutex
 	workers      int
 	compool      []Pool
-	requestQueue *RingBuffer[*Task]
+	requestQueue chan *Task // Use blocking channel instead of RingBuffer
 	pending      sync.Map
 	activeConns  sync.Map
 	//nolint:containedctx // Necessary for task cancellation within broker queue.
@@ -75,6 +73,7 @@ type broker struct {
 	wg      sync.WaitGroup
 	closing atomic.Bool
 	config  *BrokerConfig
+	poolIdx atomic.Uint32 // atomic pool selection index
 }
 
 // NoopLogger provides a default no-op logger.
@@ -111,7 +110,7 @@ func NewBroker(p []Pool, n int, l Logger, config *BrokerConfig) Broker {
 	return &broker{
 		workers:      n,
 		compool:      p,
-		requestQueue: NewRingBuffer[*Task](uint64(config.QueueSize)),
+		requestQueue: make(chan *Task, config.QueueSize), // Buffered channel for efficient queuing
 		ctx:          ctx,
 		cancel:       cancel,
 		logger:       l,
@@ -122,44 +121,34 @@ func NewBroker(p []Pool, n int, l Logger, config *BrokerConfig) Broker {
 
 // Send sends a request and waits for the response.
 func (b *broker) Send(req *[]byte) ([]byte, error) {
-	// Return error if no pool connections are available.
 	allUsed := true
 	for _, p := range b.compool {
 		if p.Len() < p.Cap() {
 			allUsed = false
-
 			break
 		}
 	}
-
 	if allUsed {
 		return nil, ErrClosingBroker
 	}
-
 	task := b.newTask(context.Background(), req)
-
-	b.mu.Lock()
 	if b.closing.Load() {
-		b.mu.Unlock()
-
 		return nil, ErrClosingBroker
 	}
 	b.pending.Store(task.id, task)
-	b.mu.Unlock()
-
-	// enqueue without blocking; fail if broker closing or queue full
-	if b.ctx.Err() != nil || !b.requestQueue.Enqueue(task) {
+	// Use non-blocking channel send - fail if queue is full or broker closing
+	select {
+	case b.requestQueue <- task:
+		// Successfully queued
+	default:
+		// Queue full or broker closing
 		b.failPending(task)
-
 		return nil, ErrClosingBroker
 	}
-
 	select {
 	case resp := <-task.response:
-
 		return resp, nil
 	case err := <-task.errCh:
-
 		return nil, err
 	}
 }
@@ -167,43 +156,35 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 // SendContext sends a request with context support.
 func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 	task := b.newTask(ctx, req)
-
-	b.mu.Lock()
 	if b.closing.Load() {
-		b.mu.Unlock()
-
 		return nil, ErrClosingBroker
 	}
 	b.pending.Store(task.id, task)
-	b.mu.Unlock()
-
-	// enqueue without blocking; handle context and broker closing
-	if b.ctx.Err() != nil {
+	// Use non-blocking channel send with context checking
+	select {
+	case b.requestQueue <- task:
+		// Successfully queued
+	case <-ctx.Done():
 		b.failPending(task)
-
-		return nil, ErrClosingBroker
-	}
-	if ctx.Err() != nil {
-		b.failPending(task)
-
 		return nil, ctx.Err()
-	}
-	if !b.requestQueue.Enqueue(task) {
+	default:
+		// Queue full or broker closing
 		b.failPending(task)
-
+		if b.ctx.Err() != nil {
+			return nil, ErrClosingBroker
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, ErrClosingBroker
 	}
-
 	select {
 	case resp := <-task.response:
-
 		return resp, nil
 	case err := <-task.errCh:
-
 		return nil, err
 	case <-ctx.Done():
 		b.failPending(task)
-
 		return nil, ctx.Err()
 	}
 }
@@ -238,59 +219,61 @@ func (b *broker) Start() error {
 
 func (b *broker) loop(_ int) error {
 	for {
-		// exit if broker is closing
-		if b.ctx.Err() != nil {
-			return ErrQuit
-		}
-		// attempt to dequeue next task
-		task, ok := b.requestQueue.Dequeue()
-		if !ok {
-			continue // no task available
-		}
-
-		if b.closing.Load() {
-			b.trySendError(task, ErrClosingBroker)
-
-			continue
-		}
-
-		taskCtx := task.Context()
-
-		b.connMu.RLock()
-		p := b.pickConnPool()
-		b.connMu.RUnlock()
-
-		if p == nil {
-			b.trySendError(task, ErrNoPoolsAvailable)
-
-			continue
-		}
-
-		var wr PoolItem
-		var err error
-		if taskCtx != nil {
-			wr, err = p.GetWithContext(taskCtx)
-		} else {
-			wr, err = p.Get()
-		}
-
-		if err != nil {
-			if taskCtx != nil && errors.Is(err, taskCtx.Err()) {
+		// Blocking receive from queue - this eliminates spinning!
+		// Workers will efficiently block until work is available
+		select {
+		case task := <-b.requestQueue:
+			if task == nil {
+				b.logger.Errorf("broker: received nil task (possible bug)")
 				continue
 			}
-			b.trySendError(task, fmt.Errorf("failed to get connection: %w", err))
 
-			continue
+			// Check closing status without context - faster atomic check
+			if b.closing.Load() {
+				b.trySendError(task, ErrClosingBroker)
+				continue
+			}
+
+			// Get task context once and cache it
+			taskCtx := task.Context()
+
+			// Use lock-free pool selection
+			p := b.pickConnPool()
+
+			if p == nil {
+				b.trySendError(task, ErrNoPoolsAvailable)
+				continue
+			}
+
+			// Context-aware connection retrieval
+			var wr PoolItem
+			var err error
+			if taskCtx != nil {
+				wr, err = p.GetWithContext(taskCtx)
+			} else {
+				wr, err = p.Get()
+			}
+
+			if err != nil {
+				// Only check context error after operation failure
+				if taskCtx != nil && errors.Is(err, taskCtx.Err()) {
+					continue
+				}
+				b.trySendError(task, fmt.Errorf("failed to get connection: %w", err))
+				continue
+			}
+
+			err = b.handleConnection(task, wr)
+			if err != nil {
+				p.Release(wr)
+				continue
+			}
+
+			p.Put(wr)
+
+		case <-b.ctx.Done():
+			return ErrQuit
 		}
-
-		err = b.handleConnection(task, wr)
-		if err != nil {
-			p.Release(wr)
-
-			continue
-		}
-
-		p.Put(wr)
 	}
 }
 
@@ -303,14 +286,11 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 		return err
 	}
 
-	b.connMu.Lock()
+	// sync.Map is already thread-safe, no additional locking needed
 	b.activeConns.Store(task.id, netConn)
-	b.connMu.Unlock()
 
 	defer func() {
-		b.connMu.Lock()
 		b.activeConns.Delete(task.id)
-		b.connMu.Unlock()
 	}()
 
 	cmd := b.addTask(task)
@@ -384,13 +364,15 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 }
 
 func (b *broker) pickConnPool() Pool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	if len(b.compool) == 0 {
 		return nil
 	}
-
-	return b.activePool()[b.rng.Intn(len(b.compool))]
+	if len(b.compool) == 1 {
+		return b.compool[0]
+	}
+	// Atomic round-robin pool selection for better load distribution
+	idx := b.poolIdx.Add(1) % uint32(len(b.compool))
+	return b.compool[idx]
 }
 
 func (b *broker) activePool() []Pool {
@@ -416,7 +398,6 @@ func (b *broker) respondPending(resp []byte) {
 		task, castOK := value.(*Task)
 		if !castOK {
 			b.pending.Delete(taskID)
-
 			return
 		}
 
@@ -432,8 +413,6 @@ func (b *broker) respondPending(resp []byte) {
 
 		if sent {
 			b.pending.Delete(taskID)
-
-			// Return task ID to pool if optimization is enabled.
 			if task.optimized {
 				globalTaskIDPool.putTaskID(task.taskID)
 			}
@@ -443,12 +422,9 @@ func (b *broker) respondPending(resp []byte) {
 
 func (b *broker) failPending(task *Task) {
 	b.pending.Delete(task.id)
-
-	// Return task ID to pool if optimization is enabled.
 	if task.optimized {
 		globalTaskIDPool.putTaskID(task.taskID)
 	}
-
 	func() {
 		defer func() { _ = recover() }()
 		close(task.response)

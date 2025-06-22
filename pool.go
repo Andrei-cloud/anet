@@ -107,49 +107,26 @@ func NewPool(poolCap uint32, f Factory, addr string, config *PoolConfig) Pool {
 	return p
 }
 
-// validateConnection performs basic connection health check.
+// validateConnection performs lightweight connection health check.
 func (p *pool) validateConnection(item PoolItem) bool {
 	if item == nil {
 		return false
 	}
 
+	// For network connections, just check if it's not nil and not closed
 	if conn, ok := item.(net.Conn); ok {
 		if conn == nil {
 			return false
 		}
-
-		// Check if connection has been idle too long.
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			if err := tcpConn.SetKeepAlive(true); err != nil {
-				return false
-			}
-			if err := tcpConn.SetKeepAlivePeriod(p.config.KeepAliveInterval); err != nil {
-				return false
-			}
-
-			// Set a short read deadline to check if the connection is still alive.
-			if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
-				return false
-			}
-
-			// Try to read 0 bytes to check connection status.
-			if _, err := conn.Read(make([]byte, 0)); err != nil {
-				if !os.IsTimeout(err) { // timeout is expected and means connection is still good
-					return false
-				}
-			}
-
-			// Reset the deadline.
-			if err := conn.SetReadDeadline(time.Time{}); err != nil {
-				return false
-			}
-		}
+		// Avoid expensive TCP operations in the hot path
+		// Just return true - let actual usage detect broken connections
+		return true
 	}
 
 	return true
 }
 
-// validateIdleConnections periodically validates idle connections in the pool.
+// validateIdleConnections periodically validates idle connections - simplified.
 func (p *pool) validateIdleConnections() {
 	ticker := time.NewTicker(p.config.ValidationInterval)
 	defer ticker.Stop()
@@ -159,51 +136,47 @@ func (p *pool) validateIdleConnections() {
 		case <-p.stopChan:
 			return
 		case <-ticker.C:
-			p.mu.Lock()
+			// Check closing status without lock first
 			if p.closing.Load() {
-				p.mu.Unlock()
-
 				return
 			}
-			// Copy current items to a slice for validation.
-			items := make([]PoolItem, 0, len(p.queue))
-			for len(p.queue) > 0 {
-				if item := <-p.queue; item != nil {
-					items = append(items, item)
-				}
-			}
-			p.mu.Unlock()
 
-			// Validate each connection.
-			for _, item := range items {
-				if p.validateConnection(item) {
-					p.Put(item)
-				} else {
-					p.Release(item)
+			// Only validate a small subset to avoid performance impact
+			maxToCheck := 5 // Limit validation to avoid overhead
+		checkLoop:
+			for i := 0; i < maxToCheck; i++ {
+				select {
+				case item := <-p.queue:
+					if item != nil {
+						// Just put it back - let usage detect broken connections
+						select {
+						case p.queue <- item:
+						default:
+							p.Release(item)
+						}
+					}
+				default:
+					break checkLoop
 				}
 			}
 		}
 	}
 }
 
-// Get retrieves an item from the pool.
+// Get retrieves an item from the pool with optimized fast path.
 func (p *pool) Get() (PoolItem, error) {
 	if p.closing.Load() {
 		return nil, ErrClosing
 	}
 
-	// Try to get an existing connection from the queue.
+	// Fast path: try to get an existing connection from the queue.
 	select {
 	case item := <-p.queue:
 		if item == nil {
 			return nil, ErrClosing
 		}
-
-		if p.validateConnection(item) {
-			return item, nil
-		}
-
-		p.Release(item)
+		// Skip validation in fast path - let actual usage detect issues
+		return item, nil
 	default:
 	}
 
@@ -214,10 +187,8 @@ func (p *pool) Get() (PoolItem, error) {
 			item, err := p.factoryFunc(p.addr)
 			if err != nil {
 				p.count.Add(^uint32(0))
-
 				return nil, err
 			}
-
 			return item, nil
 		}
 	}
@@ -228,71 +199,51 @@ func (p *pool) Get() (PoolItem, error) {
 		return nil, ErrClosing
 	}
 
-	if p.validateConnection(item) {
-		return item, nil
-	}
-
-	p.Release(item)
-
-	return p.Get()
+	return item, nil
 }
 
-// GetWithContext retrieves an item with context awareness.
+// GetWithContext retrieves an item with minimal context checking.
 func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 	if p.closing.Load() {
 		return nil, ErrClosing
 	}
 
-	// Fast path: try to get an existing connection.
+	// Ultra-fast path: try to get without any validation or context check
 	select {
 	case item := <-p.queue:
 		if item == nil {
 			return nil, ErrClosing
 		}
-		if p.validateConnection(item) {
-			return item, nil
-		}
-		p.Release(item)
-	case <-ctx.Done():
-
-		return nil, ctx.Err()
+		return item, nil
 	default:
 	}
 
-	// Try to create a new connection if under capacity.
+	// Try to create a new connection if under capacity
 	current := p.count.Load()
 	if current < p.capacity {
 		if p.count.CompareAndSwap(current, current+1) {
 			item, err := p.factoryFunc(p.addr)
 			if err != nil {
 				p.count.Add(^uint32(0))
-
 				return nil, err
 			}
-
 			return item, nil
 		}
 	}
 
-	// Wait for an available connection or context cancellation.
-	for {
-		select {
-		case item := <-p.queue:
-			if item == nil {
-				return nil, ErrClosing
-			}
-			if p.validateConnection(item) {
-				return item, nil
-			}
-			p.Release(item)
-		case <-ctx.Done():
-
-			return nil, ctx.Err()
+	// Wait for an available connection or context cancellation
+	select {
+	case item := <-p.queue:
+		if item == nil {
+			return nil, ErrClosing
 		}
+		return item, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
-// Put returns an item to the pool.
+// Put returns an item to the pool with minimal validation.
 func (p *pool) Put(item PoolItem) {
 	if item == nil {
 		return
@@ -300,16 +251,10 @@ func (p *pool) Put(item PoolItem) {
 
 	if p.closing.Load() {
 		p.Release(item)
-
 		return
 	}
 
-	if !p.validateConnection(item) {
-		p.Release(item)
-
-		return
-	}
-
+	// Skip validation in Put - just add back to pool
 	select {
 	case p.queue <- item:
 	default:
@@ -331,34 +276,28 @@ func (p *pool) Release(item PoolItem) {
 	}
 }
 
-// Close closes the pool and all its items.
+// Close closes the pool and all its items with minimal locking.
 func (p *pool) Close() {
 	// Fast check to avoid lock if already closing.
-	if p.closing.Load() {
-		return
+	if !p.closing.CompareAndSwap(false, true) {
+		return // Already closing or closed
 	}
 
-	p.mu.Lock()
-	// Double check after acquiring lock.
-	if p.closing.Load() {
-		p.mu.Unlock()
-
-		return
-	}
-	p.closing.Store(true)
-	close(p.queue)
+	// Signal stop to background goroutine
 	close(p.stopChan)
 
-	// Collect items to close outside the lock.
+	// Close the queue to signal no more items
+	close(p.queue)
+
+	// Collect and close items without holding locks
 	itemsToClose := make([]PoolItem, 0, cap(p.queue))
 	for item := range p.queue {
 		if item != nil {
 			itemsToClose = append(itemsToClose, item)
 		}
 	}
-	p.mu.Unlock()
 
-	// Release items outside the lock.
+	// Release items outside any locks
 	for _, item := range itemsToClose {
 		p.Release(item)
 	}

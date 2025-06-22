@@ -8,24 +8,22 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/andrei-cloud/anet"
 )
 
-// waitGroupWithTimeout attempts to wait for a WaitGroup with a timeout.
-// Returns true if the WaitGroup completed before timeout, false otherwise.
-// This is useful for preventing tests from hanging indefinitely.
+// waitGroupWithTimeout waits for the wait group or times out.
 func waitGroupWithTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
-	done := make(chan struct{})
+	c := make(chan struct{})
 	go func() {
+		defer close(c)
 		wg.Wait()
-		close(done)
 	}()
-
 	select {
-	case <-done:
+	case <-c:
 		return true
 	case <-time.After(timeout):
 		return false
@@ -34,18 +32,7 @@ func waitGroupWithTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
 
 // StartTestServer creates a TCP server for testing that echoes back any received messages.
 // It implements the anet message framing protocol with proper error handling and graceful shutdown.
-//
-// Returns:
-//   - The server's address as a string
-//   - A cleanup function that should be called to stop the server
-//   - Any error that occurred during server setup
-//
-// The server:
-//   - Uses proper connection deadlines to prevent hanging
-//   - Configures TCP keepalive for connection health
-//   - Handles connection errors gracefully
-//   - Tracks and waits for active connections during shutdown
-//   - Implements clean shutdown with timeout
+// Enhanced for robustness under heavy benchmark load.
 func StartTestServer() (string, func() error, error) {
 	quit := make(chan struct{})
 	ready := make(chan struct{})
@@ -55,29 +42,55 @@ func StartTestServer() (string, func() error, error) {
 		return "", nil, err
 	}
 
-	// Track active connections for clean shutdown
-	var activeConnections sync.WaitGroup
-	shutdownTimeout := 5 * time.Second
+	// Configurable parameters via environment variables
+	maxConns := 200 // default
+	if v := os.Getenv("ANET_TESTSERVER_MAX_CONNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxConns = n
+		}
+	}
+	readDeadline := 30 * time.Second // increased for heavy load
+	if v := os.Getenv("ANET_TESTSERVER_READ_DEADLINE"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			readDeadline = d
+		}
+	}
+	writeDeadline := 30 * time.Second // increased for heavy load
+	if v := os.Getenv("ANET_TESTSERVER_WRITE_DEADLINE"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			writeDeadline = d
+		}
+	}
+	logVerbose := os.Getenv("ANET_TESTSERVER_VERBOSE") == "1"
+	shutdownTimeout := 15 * time.Second // increased for heavy load
 
-	// Create a mutex to protect the listener during close
 	var listenerMu sync.Mutex
 	var listenerClosed bool
+	listenerCond := sync.NewCond(&listenerMu)
+
+	if tcpListener, ok := l.(*net.TCPListener); ok {
+		_ = tcpListener.SetDeadline(time.Now().Add(30 * time.Second)) // longer deadline
+	}
+
+	connSem := make(chan struct{}, maxConns)
+	var activeConnections sync.WaitGroup
 
 	go func() {
-		// Signal that the server is ready to accept connections
 		close(ready)
-
+		acceptBackoff := 5 * time.Millisecond
+		maxBackoff := 200 * time.Millisecond
 		for {
-			// Use a timeout on Accept to avoid blocking forever on shutdown
 			listenerMu.Lock()
-			if listenerClosed {
+			closed := listenerClosed
+			if closed {
 				listenerMu.Unlock()
 				return
 			}
-			if tcpListener, ok := l.(*net.TCPListener); ok {
-				_ = tcpListener.SetDeadline(time.Now().Add(500 * time.Millisecond))
-			}
 			listenerMu.Unlock()
+
+			if tcpListener, ok := l.(*net.TCPListener); ok {
+				_ = tcpListener.SetDeadline(time.Now().Add(30 * time.Second))
+			}
 
 			select {
 			case <-quit:
@@ -86,78 +99,118 @@ func StartTestServer() (string, func() error, error) {
 				conn, err := l.Accept()
 				if err != nil {
 					if errors.Is(err, net.ErrClosed) {
-						log.Printf("Test server listener closed.")
+						if logVerbose {
+							log.Printf("Test server listener closed.")
+						}
+						listenerCond.Broadcast()
 						return
 					} else if os.IsTimeout(err) {
+						acceptBackoff *= 2
+						if acceptBackoff > maxBackoff {
+							acceptBackoff = maxBackoff
+						}
+						listenerMu.Lock()
+						listenerCond.Wait()
+						listenerMu.Unlock()
 						continue
 					}
-					log.Printf("Test server accept error: %v", err)
-
+					if ne, ok := err.(net.Error); ok && ne.Temporary() {
+						if logVerbose {
+							log.Printf("Test server temporary accept error: %v", err)
+						}
+						acceptBackoff *= 2
+						if acceptBackoff > maxBackoff {
+							acceptBackoff = maxBackoff
+						}
+						listenerMu.Lock()
+						listenerCond.Wait()
+						listenerMu.Unlock()
+						continue
+					}
+					if logVerbose {
+						log.Printf("Test server accept error: %v", err)
+					}
+					listenerMu.Lock()
+					listenerCond.Wait()
+					listenerMu.Unlock()
 					continue
+				}
+				acceptBackoff = 5 * time.Millisecond // reset on success
+
+				// Acquire connection semaphore
+				select {
+				case connSem <- struct{}{}:
+					// proceed
+				case <-quit:
+					_ = conn.Close()
+					return
 				}
 
 				activeConnections.Add(1)
 				go func(conn net.Conn) {
+					var shouldBroadcast bool
 					defer func() {
 						_ = conn.Close()
+						<-connSem
 						activeConnections.Done()
+						// Only broadcast if we were at maxConns
+						if len(connSem) == maxConns-1 {
+							shouldBroadcast = true
+						}
+						if shouldBroadcast {
+							listenerCond.Broadcast()
+						}
 					}()
 
-					// Configure TCP keepalive
 					if tcpConn, ok := conn.(*net.TCPConn); ok {
 						_ = tcpConn.SetKeepAlive(true)
-						_ = tcpConn.SetKeepAlivePeriod(2 * time.Second)
+						_ = tcpConn.SetKeepAlivePeriod(1 * time.Second)
 					}
 
 					for {
-						// Reset read deadline for each message
-						if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-							if !errors.Is(err, net.ErrClosed) {
+						if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+							if logVerbose && !errors.Is(err, net.ErrClosed) {
 								log.Printf("Test server set read deadline error: %v", err)
 							}
-
 							return
 						}
-
-						// Read the incoming message
 						requestMsg, err := anet.Read(conn)
 						if err != nil {
 							if err != io.EOF && !errors.Is(err, net.ErrClosed) {
-								log.Printf("Test server read error: %v", err)
+								if ne, ok := err.(net.Error); ok && ne.Temporary() {
+									if logVerbose {
+										log.Printf("Test server temporary read error: %v", err)
+									}
+									continue
+								}
+								if logVerbose {
+									log.Printf("Test server read error: %v", err)
+								}
 							}
-
 							return
 						}
-
-						// Reset write deadline for response
-						if err := conn.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
-							if !errors.Is(err, net.ErrClosed) {
+						if err := conn.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
+							if logVerbose && !errors.Is(err, net.ErrClosed) {
 								log.Printf("Test server set write deadline error: %v", err)
 							}
-
 							return
 						}
-
-						// Echo the message back
 						err = anet.Write(conn, requestMsg)
 						if err != nil {
 							if !errors.Is(err, net.ErrClosed) {
-								log.Printf("Test server write error: %v", err)
+								if ne, ok := err.(net.Error); ok && ne.Temporary() {
+									if logVerbose {
+										log.Printf("Test server temporary write error: %v", err)
+									}
+									continue
+								}
+								if logVerbose {
+									log.Printf("Test server write error: %v", err)
+								}
 							}
-
 							return
 						}
-
-						// Clear deadlines after response
-						if err := conn.SetDeadline(time.Time{}); err != nil {
-							if !errors.Is(err, net.ErrClosed) {
-								log.Printf("Test server clear deadline error: %v", err)
-							}
-
-							return
-						}
-
-						// Check if server is shutting down
+						_ = conn.SetDeadline(time.Time{})
 						select {
 						case <-quit:
 							return
@@ -170,24 +223,18 @@ func StartTestServer() (string, func() error, error) {
 		}
 	}()
 
-	// Wait for server to be ready
 	<-ready
 
 	return l.Addr().String(), func() error {
-		// Signal all accept loops to quit
 		close(quit)
-
-		// Close the listener with proper mutex protection
 		listenerMu.Lock()
 		listenerClosed = true
 		err := l.Close()
 		listenerMu.Unlock()
-
-		// Wait for all active connections to complete
+		// Wait for all connections to close (waitgroup version)
 		if !waitGroupWithTimeout(&activeConnections, shutdownTimeout) {
 			log.Printf("Timed out waiting for test server connections to close")
 		}
-
 		return err
 	}, nil
 }
