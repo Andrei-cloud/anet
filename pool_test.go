@@ -493,12 +493,12 @@ func BenchmarkPool(b *testing.B) {
 	}
 	defer func() { _ = stop() }() // Ignore error from stop
 
-	worker_num := []int{1}
+	workerNum := []int{1}
 	factory := func(addr string) (anet.PoolItem, error) {
 		return net.Dial("tcp", addr)
 	}
 
-	for _, i := range worker_num {
+	for _, i := range workerNum {
 		p := anet.NewPool(1, factory, addr, nil) // Use default config
 		require.NotNil(b, p)
 		b.Run(fmt.Sprintf("Workers %d", i), func(b *testing.B) {

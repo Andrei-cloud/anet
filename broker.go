@@ -139,6 +139,7 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 	for _, p := range b.compool {
 		if p.Len() < p.Cap() {
 			allUsed = false
+
 			break
 		}
 	}
@@ -159,6 +160,7 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 	default:
 		// Queue full or broker closing
 		b.failPending(task)
+
 		return nil, ErrClosingBroker
 	}
 	select {
@@ -182,6 +184,7 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 		// Successfully queued
 	case <-ctx.Done():
 		b.failPending(task)
+
 		return nil, ctx.Err()
 	default:
 		// Queue full or broker closing
@@ -202,6 +205,7 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 		return nil, err
 	case <-ctx.Done():
 		b.failPending(task)
+
 		return nil, ctx.Err()
 	}
 }
@@ -242,12 +246,14 @@ func (b *broker) loop(_ int) error {
 		case task := <-b.requestQueue:
 			if task == nil {
 				b.logger.Errorf("broker: received nil task (possible bug)")
+
 				continue
 			}
 
 			// Check closing status without context - faster atomic check
 			if b.closing.Load() {
 				b.trySendError(task, ErrClosingBroker)
+
 				continue
 			}
 
@@ -259,6 +265,7 @@ func (b *broker) loop(_ int) error {
 
 			if p == nil {
 				b.trySendError(task, ErrNoPoolsAvailable)
+
 				continue
 			}
 
