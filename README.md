@@ -136,7 +136,7 @@ broker := anet.NewBroker(pools, workers, logger, config)
 
 ### Load Balancing
 
-When using multiple connection pools, requests are distributed across pools using a random selection algorithm. This provides basic load balancing and failover:
+When using multiple connection pools, requests are distributed across pools using a round-robin selection algorithm. This provides basic load balancing and failover:
 
 ```go
 // Create pools for multiple backend servers
@@ -194,6 +194,7 @@ brokerCfg := &anet.BrokerConfig{
     OptimizeMemory: true, // Enable memory optimizations
 }
 broker := anet.NewBroker(pools, 3, nil, brokerCfg)
+// Broker.Start() is a blocking run loop; typically run it in a goroutine.
 go broker.Start()
 resp, err := broker.Send(&[]byte("hello"))
 ```
@@ -219,7 +220,14 @@ resp, err := broker.Send(&[]byte("hello"))
 * `ErrTimeout`: Response not received within deadline.
 * `ErrQuit`: Broker is shutting down normally.
 * `ErrClosingBroker`: Broker is in process of closing.
+* `ErrQueueFull`: Broker request queue is full (backpressure; broker not closing).
 * `ErrNoPoolsAvailable`: No connection pools are available.
 * `ErrClosing`: Pool is shutting down.
 * `ErrInvalidMsgLength`: Message length header is invalid.
 * `ErrMaxLenExceeded`: Message exceeds maximum allowed size.
+
+## Configuration Semantics Notes
+
+### PoolConfig
+
+The current pool implementation focuses on fast-path Get/Put with minimal validation. Fields like `IdleTimeout` and `KeepAliveInterval` are primarily applied on the server side in this repository; client-side idle eviction is limited to a light, periodic subset validation to avoid hot-path overhead. Extend the pool if strict idle eviction is required.

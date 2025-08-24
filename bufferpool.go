@@ -82,6 +82,11 @@ func (bp *bufferPool) getBuffer(size int) []byte {
 	// retrieve buffer from pool and check type assertion.
 	obj := bp.pools[poolIdx].Get()
 	if buf, ok := obj.([]byte); ok {
+		// Ensure length matches pool class; capacity is at least poolSize.
+		if len(buf) != poolSize {
+			buf = buf[:poolSize]
+		}
+
 		return buf
 	}
 	// fallback allocation if buffer type is not as expected.
@@ -104,6 +109,10 @@ func (bp *bufferPool) putBuffer(buf []byte) {
 		poolIdx++
 	}
 
+	// Normalize slice length to the class size before putting back.
+	if len(buf) != poolSize {
+		buf = buf[:poolSize]
+	}
 	//nolint:staticcheck // SA6002: passing buf by value is necessary for the pool.
 	bp.pools[poolIdx].Put(buf)
 }

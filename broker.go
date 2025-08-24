@@ -22,6 +22,9 @@ var (
 
 	// ErrNoPoolsAvailable indicates no connection pools are available.
 	ErrNoPoolsAvailable = errors.New("no connection pools available")
+
+	// ErrQueueFull indicates the broker's request queue is full.
+	ErrQueueFull = errors.New("broker queue full")
 )
 
 // BrokerConfig contains configuration options for a broker.
@@ -160,11 +163,22 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 	default:
 		// Queue full or broker closing
 		b.failPending(task)
+		if b.closing.Load() || b.ctx.Err() != nil {
+			return nil, ErrClosingBroker
+		}
 
-		return nil, ErrClosingBroker
+		return nil, ErrQueueFull
 	}
 	select {
 	case resp := <-task.response:
+		// Success path: cleanup here to avoid racing with responder goroutines.
+		b.pending.Delete(task.id)
+		if task.optimized {
+			globalTaskIDPool.putTaskID(task.taskID)
+		}
+		// Return pooled objects after consumer has received the response.
+		b.returnTaskToPool(task)
+
 		return resp, nil
 	case err := <-task.errCh:
 		return nil, err
@@ -189,17 +203,24 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 	default:
 		// Queue full or broker closing
 		b.failPending(task)
-		if b.ctx.Err() != nil {
+		if b.closing.Load() || b.ctx.Err() != nil {
 			return nil, ErrClosingBroker
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
 
-		return nil, ErrClosingBroker
+		return nil, ErrQueueFull
 	}
 	select {
 	case resp := <-task.response:
+		// Success path: cleanup here to avoid racing with responder goroutines.
+		b.pending.Delete(task.id)
+		if task.optimized {
+			globalTaskIDPool.putTaskID(task.taskID)
+		}
+		b.returnTaskToPool(task)
+
 		return resp, nil
 	case err := <-task.errCh:
 		return nil, err
@@ -319,6 +340,8 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 	}()
 
 	cmd := b.addTask(task)
+	// Ensure command buffer is returned to pool after use.
+	defer func() { globalBufferPool.putBuffer(cmd) }()
 
 	if b.closing.Load() {
 		b.trySendError(task, ErrClosingBroker)
@@ -339,49 +362,35 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 		return err
 	}
 
-	readDeadline := time.Now().Add(b.config.ReadTimeout)
-	if err := netConn.SetReadDeadline(readDeadline); err != nil {
-		b.trySendError(task, fmt.Errorf("setting read deadline: %w", err))
-
-		return err
+	// Compute read deadline as the earlier of broker ReadTimeout and task context deadline (if any).
+	var readDeadline time.Time
+	if b.config.ReadTimeout > 0 {
+		readDeadline = time.Now().Add(b.config.ReadTimeout)
 	}
-
-	taskCtx := task.Context()
-	if taskCtx != nil {
-		done := make(chan struct{})
-		var readErr error
-		go func() {
-			defer close(done)
-			resp, err := Read(netConn)
-			if err != nil {
-				readErr = fmt.Errorf("reading from connection: %w", err)
-				b.trySendError(task, readErr)
-
-				return
+	if taskCtx := task.Context(); taskCtx != nil {
+		if dl, ok := taskCtx.Deadline(); ok {
+			if readDeadline.IsZero() || dl.Before(readDeadline) {
+				readDeadline = dl
 			}
-			b.respondPending(resp)
-		}()
-
-		select {
-		case <-taskCtx.Done():
-			err := taskCtx.Err()
+		}
+	}
+	if !readDeadline.IsZero() {
+		if err := netConn.SetReadDeadline(readDeadline); err != nil {
+			b.trySendError(task, fmt.Errorf("setting read deadline: %w", err))
 
 			return err
-		case <-done:
-			if readErr != nil {
-				return readErr
-			}
 		}
-	} else {
-		resp, err := Read(netConn)
-		if err != nil {
-			wrappedErr := fmt.Errorf("reading from connection: %w", err)
-			b.trySendError(task, wrappedErr)
-
-			return wrappedErr
-		}
-		b.respondPending(resp)
 	}
+
+	// Synchronous read avoids goroutine leaks and ensures connection isn't reused concurrently.
+	resp, err := Read(netConn)
+	if err != nil {
+		wrappedErr := fmt.Errorf("reading from connection: %w", err)
+		b.trySendError(task, wrappedErr)
+
+		return wrappedErr
+	}
+	b.respondPending(resp)
 
 	_ = netConn.SetDeadline(time.Time{})
 
@@ -423,34 +432,13 @@ func (b *broker) respondPending(resp []byte) {
 			return
 		}
 
-		sent := false
+		// Deliver the response. Block until the receiver reads it.
+		// Do not delete pending or return task here; the waiting sender will
+		// perform cleanup after receiving to avoid races.
 		func() {
 			defer func() { _ = recover() }()
-			select {
-			case task.response <- resp[taskIDSize:]:
-				sent = true
-			default:
-			}
+			task.response <- resp[taskIDSize:]
 		}()
-
-		if sent {
-			b.pending.Delete(taskID)
-			if task.optimized {
-				globalTaskIDPool.putTaskID(task.taskID)
-			}
-			// Return successful tasks to pool as well
-			if task.pooled {
-				// Don't close channels for successful response, just return to pool
-				go func() {
-					// Wait briefly to ensure response was read, then return to pool
-					select {
-					case <-task.response:
-					case <-time.After(time.Millisecond):
-					}
-					b.returnTaskToPool(task)
-				}()
-			}
-		}
 	}
 }
 
@@ -553,8 +541,35 @@ func (b *broker) addTask(task *Task) []byte {
 
 // Close shuts down the broker, canceling context and waiting for workers to exit.
 func (b *broker) Close() {
-	// cancel broker context to stop workers
+	// Ensure idempotent shutdown
+	if !b.closing.CompareAndSwap(false, true) {
+		return
+	}
+
+	// Best-effort: fail any queued tasks immediately to unblock senders
+	for {
+		select {
+		case task := <-b.requestQueue:
+			if task != nil {
+				b.trySendError(task, ErrClosingBroker)
+			}
+		default:
+			goto drained
+		}
+	}
+drained:
+
+	// Inform all pending tasks that we're closing
+	b.pending.Range(func(key, value any) bool {
+		if task, ok := value.(*Task); ok && task != nil {
+			b.trySendError(task, ErrClosingBroker)
+		}
+		b.pending.Delete(key)
+
+		return true
+	})
+
+	// Cancel broker context to stop workers and wait for them to exit
 	b.cancel()
-	// wait for all worker goroutines to finish
 	b.wg.Wait()
 }

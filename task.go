@@ -2,6 +2,7 @@ package anet
 
 import (
 	"context"
+	"sync"
 )
 
 // Constants for task management.
@@ -15,12 +16,12 @@ const (
 var nextTaskID uint32
 
 // globalTaskIDPool is the pool of pre-allocated task IDs.
-var globalTaskIDPool = newTaskIDPool(1024) // Pre-allocate 1024 task IDs.
+var globalTaskIDPool = newTaskIDPool(1024) // Initial target size (advisory only).
 
-// taskIDPool manages reusable task ID byte arrays to reduce allocations.
+// taskIDPool manages reusable task ID byte arrays using a sync.Pool for
+// concurrency safety and reduced allocations.
 type taskIDPool struct {
-	pool *RingBuffer[[4]byte] // Ring buffer of pre-allocated 4-byte arrays.
-	size uint64               // Size of the pool.
+	pool sync.Pool
 }
 
 // Task represents a single request/response operation managed by the broker.
@@ -39,40 +40,37 @@ type Task struct {
 }
 
 // newTaskIDPool creates a new task ID pool with the specified size.
-func newTaskIDPool(size uint64) *taskIDPool {
-	pool := NewRingBuffer[[4]byte](size)
-	// Pre-fill the pool with task ID arrays.
-	for i := uint64(0); i < size; i++ {
-		var taskIDArray [4]byte
-		pool.Enqueue(taskIDArray)
+func newTaskIDPool(_ uint64) *taskIDPool {
+	tp := &taskIDPool{}
+	tp.pool = sync.Pool{
+		New: func() any {
+			// Always produce a fresh 4-byte slice when the pool is empty.
+			return make([]byte, taskIDSize)
+		},
 	}
 
-	return &taskIDPool{
-		pool: pool,
-		size: size,
-	}
+	return tp
 }
 
 // getTaskID retrieves a task ID byte array from the pool.
-// If the pool is empty, it allocates a new one.
 func (tp *taskIDPool) getTaskID() []byte {
-	if taskIDArray, ok := tp.pool.Dequeue(); ok {
-		return taskIDArray[:]
+	if v := tp.pool.Get(); v != nil {
+		if b, ok := v.([]byte); ok && len(b) == taskIDSize {
+			return b
+		}
 	}
-	// Pool is empty, allocate new task ID.
+	// Fallback if assertion fails
 	return make([]byte, taskIDSize)
 }
 
 // putTaskID returns a task ID byte array to the pool.
-// Only returns arrays of the correct size to maintain pool integrity.
 func (tp *taskIDPool) putTaskID(taskID []byte) {
 	if len(taskID) != taskIDSize {
 		return // Don't pool incorrectly sized arrays.
 	}
-	var taskIDArray [4]byte
-	copy(taskIDArray[:], taskID)
-	// Return to pool - use blocking enqueue since pool capacity should be sufficient.
-	tp.pool.Enqueue(taskIDArray)
+	// Optionally zero the slice to avoid retaining IDs in memory; not required for correctness.
+	taskID[0], taskID[1], taskID[2], taskID[3] = 0, 0, 0, 0
+	tp.pool.Put(taskID)
 }
 
 // Context returns the task's context, which can be used for cancellation
