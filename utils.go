@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sync"
 )
 
@@ -110,36 +111,28 @@ func Write(w io.Writer, in []byte) error {
 		return ErrMaxLenExceeded
 	}
 
-	// Build frame in a single buffer.
-	//nolint:staticcheck,errcheck // ignoring errors for buffer pool Get and pointer-like warning
-	buf := writeBufPool.Get().([]byte)[:0]
-	// reserve space for length header.
-	for i := 0; i < LENGTHSIZE; i++ {
-		buf = append(buf, 0)
-	}
-	buf = append(buf, in...)
-
-	// write length header into reserved space.
+	// Build header in a small stack buffer to avoid allocations.
+	var hdr [LENGTHSIZE]byte
 	switch LENGTHSIZE {
 	case 2:
-		binary.BigEndian.PutUint16(buf, uint16(len(buf)-LENGTHSIZE))
+		binary.BigEndian.PutUint16(hdr[:], uint16(len(in)))
 	case 4:
-		binary.BigEndian.PutUint32(buf, uint32(len(buf)-LENGTHSIZE))
+		binary.BigEndian.PutUint32(hdr[:], uint32(len(in)))
 	default:
-
 		return fmt.Errorf("unsupported header size: %d", LENGTHSIZE)
 	}
 
-	if _, err := w.Write(buf); err != nil {
-		//nolint:staticcheck,errcheck // ignoring errors for buffer pool Put
-		writeBufPool.Put(buf)
-
+	// Attempt a vectorized write using net.Buffers to avoid copying payload.
+	// Falls back internally to sequential writes if writev is unavailable.
+	bufs := net.Buffers{hdr[:], in}
+	n, err := bufs.WriteTo(w)
+	if err != nil {
 		return err
 	}
-
-	//nolint:staticcheck,errcheck // ignoring errors for buffer pool Put
-	writeBufPool.Put(buf)
-
+	expected := int64(len(hdr) + len(in))
+	if n != expected {
+		return io.ErrShortWrite
+	}
 	return nil
 }
 
@@ -156,12 +149,9 @@ func Write(w io.Writer, in []byte) error {
 //   - io.EOF if the connection was closed cleanly.
 //   - Other errors for network or protocol issues.
 func Read(r io.Reader) ([]byte, error) {
-	// Get a buffer from the pool for the header.
-	headerBuf := globalBufferPool.getBuffer(LENGTHSIZE)
-	defer globalBufferPool.putBuffer(headerBuf)
-
-	// Read the length header.
-	if _, err := io.ReadFull(r, headerBuf[:LENGTHSIZE]); err != nil {
+	// Read the length header into a small stack buffer.
+	var hdr [LENGTHSIZE]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
 	}
 
@@ -169,26 +159,20 @@ func Read(r io.Reader) ([]byte, error) {
 	var length uint64
 	switch LENGTHSIZE {
 	case 2:
-		length = uint64(binary.BigEndian.Uint16(headerBuf))
+		length = uint64(binary.BigEndian.Uint16(hdr[:]))
 	case 4:
-		length = uint64(binary.BigEndian.Uint32(headerBuf))
+		length = uint64(binary.BigEndian.Uint32(hdr[:]))
 	default:
-
 		return nil, fmt.Errorf("unsupported header size: %d", LENGTHSIZE)
 	}
 
-	// Get a buffer from the pool for the message.
-	message := globalBufferPool.getBuffer(int(length))
-	defer globalBufferPool.putBuffer(message)
-
-	// Read the payload.
-	if _, err := io.ReadFull(r, message[:length]); err != nil {
+	// Allocate the exact-sized payload buffer and read directly into it.
+	if length == 0 {
+		return []byte{}, nil
+	}
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, err
 	}
-
-	// Create a new buffer containing just the payload data.
-	result := make([]byte, length)
-	copy(result, message[:length])
-
-	return result, nil
+	return payload, nil
 }

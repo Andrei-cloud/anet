@@ -82,12 +82,15 @@ func (bp *bufferPool) getBuffer(size int) []byte {
 	// retrieve buffer from pool and check type assertion.
 	obj := bp.pools[poolIdx].Get()
 	if buf, ok := obj.([]byte); ok {
-		// Ensure length matches pool class; capacity is at least poolSize.
-		if len(buf) != poolSize {
-			buf = buf[:poolSize]
-		}
+		// Ensure buffer length matches class and capacity is sufficient.
+		if cap(buf) >= poolSize {
+			if len(buf) != poolSize {
+				buf = buf[:poolSize]
+			}
 
-		return buf
+			return buf
+		}
+		// Incorrect capacity (shouldn't happen) — fall through to allocate.
 	}
 	// fallback allocation if buffer type is not as expected.
 	return make([]byte, poolSize)
@@ -97,24 +100,29 @@ func (bp *bufferPool) getBuffer(size int) []byte {
 // Buffers larger than maxBufferSize are not pooled to prevent memory bloat.
 // The buffer should not be accessed after being returned to the pool.
 func (bp *bufferPool) putBuffer(buf []byte) {
-	if len(buf) > maxBufferSize {
-		return // Don't pool large buffers.
+	// Base pooling decision and bucket on capacity to avoid mis-bucketing
+	// when callers reslice to smaller lengths.
+	if cap(buf) > maxBufferSize {
+		return // Don't pool large-capacity buffers.
 	}
 
-	// Find the correct pool
+	// Find the correct pool based on capacity
 	poolIdx := 0
 	poolSize := 32
-	for poolSize < len(buf) {
+	target := cap(buf)
+	for poolSize < target {
 		poolSize *= 2
 		poolIdx++
 	}
 
 	// Normalize slice length to the class size before putting back.
-	if len(buf) != poolSize {
-		buf = buf[:poolSize]
+	if cap(buf) >= poolSize {
+		if len(buf) != poolSize {
+			buf = buf[:poolSize]
+		}
+		//nolint:staticcheck // SA6002: passing buf by value is necessary for the pool.
+		bp.pools[poolIdx].Put(buf)
 	}
-	//nolint:staticcheck // SA6002: passing buf by value is necessary for the pool.
-	bp.pools[poolIdx].Put(buf)
 }
 
 // getBuffer retrieves a buffer from the local NUMA node pool.

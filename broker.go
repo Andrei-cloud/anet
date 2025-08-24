@@ -62,7 +62,7 @@ type broker struct {
 	workers      int
 	compool      []Pool
 	requestQueue chan *Task // Use blocking channel instead of RingBuffer
-	pending      sync.Map
+	pending      pendingTable
 	activeConns  sync.Map
 	//nolint:containedctx // Necessary for task cancellation within broker queue.
 	ctx      context.Context
@@ -75,6 +75,67 @@ type broker struct {
 	taskPool sync.Pool     // Pool for Task structs
 	respPool sync.Pool     // Pool for response channels
 	errPool  sync.Pool     // Pool for error channels
+}
+
+// pendingTable is a sharded map to store pending tasks by ID with lower
+// allocation and contention overhead than sync.Map for our access pattern.
+const pendingShards = 64
+
+type pendingTable struct {
+	shards [pendingShards]struct {
+		mu sync.Mutex
+		m  map[uint32]*Task
+	}
+}
+
+func (p *pendingTable) shard(id uint32) *struct {
+	mu sync.Mutex
+	m  map[uint32]*Task
+} {
+	return &p.shards[id&(pendingShards-1)]
+}
+
+func (p *pendingTable) Store(id uint32, t *Task) {
+	s := p.shard(id)
+	s.mu.Lock()
+	if s.m == nil {
+		s.m = make(map[uint32]*Task)
+	}
+	s.m[id] = t
+	s.mu.Unlock()
+}
+
+func (p *pendingTable) Load(id uint32) (*Task, bool) {
+	s := p.shard(id)
+	s.mu.Lock()
+	t, ok := s.m[id]
+	s.mu.Unlock()
+	return t, ok
+}
+
+func (p *pendingTable) Delete(id uint32) {
+	s := p.shard(id)
+	s.mu.Lock()
+	if s.m != nil {
+		delete(s.m, id)
+	}
+	s.mu.Unlock()
+}
+
+// ForEachAndClear applies fn to each entry, then clears the table.
+func (p *pendingTable) ForEachAndClear(fn func(id uint32, t *Task)) {
+	for i := range p.shards {
+		s := &p.shards[i]
+		s.mu.Lock()
+		for id, t := range s.m {
+			fn(id, t)
+		}
+		// Clear the shard map to release references
+		for id := range s.m {
+			delete(s.m, id)
+		}
+		s.mu.Unlock()
+	}
 }
 
 // NoopLogger provides a default no-op logger.
@@ -425,13 +486,7 @@ func (b *broker) respondPending(resp []byte) {
 	}
 	taskID := binary.BigEndian.Uint32(resp[:taskIDSize])
 
-	if value, ok := b.pending.Load(taskID); ok {
-		task, castOK := value.(*Task)
-		if !castOK {
-			b.pending.Delete(taskID)
-			return
-		}
-
+	if task, ok := b.pending.Load(taskID); ok {
 		// Deliver the response. Block until the receiver reads it.
 		// Do not delete pending or return task here; the waiting sender will
 		// perform cleanup after receiving to avoid races.
@@ -560,13 +615,10 @@ func (b *broker) Close() {
 drained:
 
 	// Inform all pending tasks that we're closing
-	b.pending.Range(func(key, value any) bool {
-		if task, ok := value.(*Task); ok && task != nil {
+	b.pending.ForEachAndClear(func(_ uint32, task *Task) {
+		if task != nil {
 			b.trySendError(task, ErrClosingBroker)
 		}
-		b.pending.Delete(key)
-
-		return true
 	})
 
 	// Cancel broker context to stop workers and wait for them to exit
