@@ -481,7 +481,6 @@ func (p *pool) validateRead(item PoolItem) error {
 	// Attempt to read a single byte
 	var b [1]byte
 	n, err := reader.Read(b[:])
-
 	if err != nil {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 			// Timeout is expected for healthy connections with no pending data
