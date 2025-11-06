@@ -3,6 +3,7 @@ package anet
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 )
 
 // Constants for task management.
@@ -37,6 +38,7 @@ type Task struct {
 	errCh     chan error      // Channel for receiving errors
 	optimized bool            // Tracks whether task uses pooled memory (for cleanup)
 	pooled    bool            // Tracks whether task struct and channels are pooled
+	refCount  int32           // Reference count for safe pooling (atomic)
 }
 
 // newTaskIDPool creates a new task ID pool with the specified size.
@@ -78,4 +80,16 @@ func (tp *taskIDPool) putTaskID(taskID []byte) {
 // when using SendContext.
 func (t *Task) Context() context.Context {
 	return t.ctx
+}
+
+// addRef increments the reference count atomically.
+// This should be called when a goroutine begins using the task.
+func (t *Task) addRef() {
+	atomic.AddInt32(&t.refCount, 1)
+}
+
+// release decrements the reference count atomically.
+// Returns true if this was the last reference and task can be safely pooled.
+func (t *Task) release() bool {
+	return atomic.AddInt32(&t.refCount, -1) == 0
 }

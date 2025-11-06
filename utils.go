@@ -133,6 +133,7 @@ func Write(w io.Writer, in []byte) error {
 	if n != expected {
 		return io.ErrShortWrite
 	}
+
 	return nil
 }
 
@@ -174,5 +175,6 @@ func Read(r io.Reader) ([]byte, error) {
 	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, err
 	}
+
 	return payload, nil
 }
