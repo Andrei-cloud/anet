@@ -47,7 +47,8 @@ func newTaskIDPool(_ uint64) *taskIDPool {
 	tp.pool = sync.Pool{
 		New: func() any {
 			// Always produce a fresh 4-byte slice when the pool is empty.
-			return make([]byte, taskIDSize)
+			b := make([]byte, taskIDSize)
+			return &b
 		},
 	}
 
@@ -57,8 +58,8 @@ func newTaskIDPool(_ uint64) *taskIDPool {
 // getTaskID retrieves a task ID byte array from the pool.
 func (tp *taskIDPool) getTaskID() []byte {
 	if v := tp.pool.Get(); v != nil {
-		if b, ok := v.([]byte); ok && len(b) == taskIDSize {
-			return b
+		if pb, ok := v.(*[]byte); ok {
+			return *pb
 		}
 	}
 	// Fallback if assertion fails
@@ -72,7 +73,7 @@ func (tp *taskIDPool) putTaskID(taskID []byte) {
 	}
 	// Optionally zero the slice to avoid retaining IDs in memory; not required for correctness.
 	taskID[0], taskID[1], taskID[2], taskID[3] = 0, 0, 0, 0
-	tp.pool.Put(taskID)
+	tp.pool.Put(&taskID)
 }
 
 // Context returns the task's context, which can be used for cancellation

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
 )
 
 // Message framing constants.
@@ -25,8 +24,6 @@ var (
 	// This is determined by the maximum value that can be stored in LENGTHSIZE bytes.
 	ErrMaxLenExceeded = errors.New("maximum message length exceeded")
 )
-
-var writeBufPool = sync.Pool{New: func() any { return make([]byte, 0, 4096) }}
 
 // RingBuffer is a fixed-size circular buffer for items of any type.
 type RingBuffer[T any] struct {

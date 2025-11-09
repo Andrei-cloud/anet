@@ -10,20 +10,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// timeoutError implements net.Error with Timeout() returning true
+// timeoutError implements net.Error with Timeout() returning true.
 type timeoutError struct{}
 
-func (e *timeoutError) Error() string   { return "timeout" }
-func (e *timeoutError) Timeout() bool   { return true }
-func (e *timeoutError) Temporary() bool { return false }
-
-// mockValidationConn is a test connection that can simulate various states
+// mockValidationConn is a test connection that can simulate various states.
 type mockValidationConn struct {
 	closed          atomic.Bool
 	readShouldError bool
 	readError       error
 	data            []byte
 	readPos         int
+}
+
+// mockBasicItem is a PoolItem that doesn't support deadlines.
+type mockBasicItem struct {
+	valid bool
+}
+
+func (e *timeoutError) Error() string   { return "timeout" }
+func (e *timeoutError) Timeout() bool   { return true }
+func (e *timeoutError) Temporary() bool { return false }
+
+func (m *mockBasicItem) Close() error {
+	return nil
 }
 
 func newMockValidationConn() *mockValidationConn {
@@ -45,6 +54,7 @@ func (m *mockValidationConn) Read(b []byte) (int, error) {
 	}
 	n := copy(b, m.data[m.readPos:])
 	m.readPos += n
+
 	return n, nil
 }
 
@@ -52,6 +62,7 @@ func (m *mockValidationConn) Write(b []byte) (int, error) {
 	if m.closed.Load() {
 		return 0, io.EOF
 	}
+
 	return len(b), nil
 }
 
@@ -60,15 +71,15 @@ func (m *mockValidationConn) Close() error {
 	return nil
 }
 
-func (m *mockValidationConn) SetDeadline(t time.Time) error {
+func (m *mockValidationConn) SetDeadline(_ time.Time) error {
 	return nil
 }
 
-func (m *mockValidationConn) SetReadDeadline(t time.Time) error {
+func (m *mockValidationConn) SetReadDeadline(_ time.Time) error {
 	return nil
 }
 
-func (m *mockValidationConn) SetWriteDeadline(t time.Time) error {
+func (m *mockValidationConn) SetWriteDeadline(_ time.Time) error {
 	return nil
 }
 
@@ -80,16 +91,8 @@ func (m *mockValidationConn) RemoteAddr() net.Addr {
 	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080}
 }
 
-// mockBasicItem is a PoolItem that doesn't support deadlines
-type mockBasicItem struct {
-	valid bool
-}
-
-func (m *mockBasicItem) Close() error {
-	return nil
-}
-
 func TestConnectionValidation(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		strategy ValidationStrategy
@@ -162,6 +165,7 @@ func TestConnectionValidation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 			config := DefaultPoolConfig()
 			config.ValidationStrategy = tt.strategy
 			config.ValidationTimeout = 100 * time.Millisecond
@@ -179,7 +183,9 @@ func TestConnectionValidation(t *testing.T) {
 }
 
 func TestValidationStrategies(t *testing.T) {
+	t.Parallel()
 	t.Run("ValidationPing with non-TCP connection", func(t *testing.T) {
+		t.Parallel()
 		config := DefaultPoolConfig()
 		config.ValidationStrategy = ValidationPing
 
@@ -192,6 +198,7 @@ func TestValidationStrategies(t *testing.T) {
 	})
 
 	t.Run("ValidationRead with retry logic", func(t *testing.T) {
+		t.Parallel()
 		config := DefaultPoolConfig()
 		config.ValidationStrategy = ValidationRead
 		config.MaxValidationAttempts = 3
@@ -215,7 +222,8 @@ func TestValidationStrategies(t *testing.T) {
 }
 
 func TestPoolValidationIntegration(t *testing.T) {
-	factory := func(addr string) (PoolItem, error) {
+	t.Parallel()
+	factory := func(_ string) (PoolItem, error) {
 		return newMockValidationConn(), nil
 	}
 
@@ -244,8 +252,9 @@ func TestPoolValidationIntegration(t *testing.T) {
 }
 
 func TestValidationSubset(t *testing.T) {
+	t.Parallel()
 	// Create mock connections with different states
-	factory := func(addr string) (PoolItem, error) {
+	factory := func(_ string) (PoolItem, error) {
 		return newMockValidationConn(), nil
 	}
 
@@ -253,20 +262,23 @@ func TestValidationSubset(t *testing.T) {
 	config.ValidationStrategy = ValidationRead
 	config.ValidationTimeout = 50 * time.Millisecond
 
-	pool := NewPool(10, factory, "test:8080", config).(*pool)
-	defer pool.Close()
+	p := NewPool(10, factory, "test:8080", config)
+	defer p.Close()
+
+	poolImpl, ok := p.(*pool)
+	require.True(t, ok)
 
 	// Fill pool with connections
 	var items []PoolItem
 	for i := 0; i < 5; i++ {
-		item, err := pool.Get()
+		item, err := p.Get()
 		require.NoError(t, err)
 		items = append(items, item)
 	}
 
 	// Return all items
 	for _, item := range items {
-		pool.Put(item)
+		p.Put(item)
 	}
 
 	// Break one connection
@@ -277,16 +289,17 @@ func TestValidationSubset(t *testing.T) {
 	}
 
 	// Run validation subset
-	pool.validateConnectionSubset()
+	poolImpl.validateConnectionSubset()
 
 	// Pool should still be functional
-	item, err := pool.Get()
+	item, err := p.Get()
 	require.NoError(t, err)
 	require.NotNil(t, item)
 }
 
 func TestValidationWithNilConfig(t *testing.T) {
-	factory := func(addr string) (PoolItem, error) {
+	t.Parallel()
+	factory := func(_ string) (PoolItem, error) {
 		return newMockValidationConn(), nil
 	}
 
@@ -301,7 +314,8 @@ func TestValidationWithNilConfig(t *testing.T) {
 	poolInstance.Put(item)
 
 	// Validate that default config is used
-	poolImpl := poolInstance.(*pool)
+	poolImpl, ok := poolInstance.(*pool)
+	require.True(t, ok)
 	require.Equal(t, ValidationRead, poolImpl.config.ValidationStrategy)
 	require.Equal(t, 1*time.Second, poolImpl.config.ValidationTimeout)
 	require.Equal(t, 3, poolImpl.config.MaxValidationAttempts)
@@ -332,7 +346,7 @@ func BenchmarkConnectionValidation(b *testing.B) {
 				for pb.Next() {
 					conn := newMockValidationConn()
 					p.validateConnection(conn)
-					conn.Close()
+					_ = conn.Close()
 				}
 			})
 		})
@@ -340,6 +354,7 @@ func BenchmarkConnectionValidation(b *testing.B) {
 }
 
 func TestValidationTimeout(t *testing.T) {
+	t.Parallel()
 	config := DefaultPoolConfig()
 	config.ValidationStrategy = ValidationRead
 	config.ValidationTimeout = 10 * time.Millisecond // Very short timeout

@@ -11,14 +11,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestTaskPoolingSafety tests that task pooling works safely under concurrent access
+// TestTaskPoolingSafety tests that task pooling works safely under concurrent access.
 func TestTaskPoolingSafety(t *testing.T) {
 	t.Parallel()
 
 	// Create test server
 	addr, stop, err := StartTestServer()
 	require.NoError(t, err)
-	defer stop()
+	defer func() { _ = stop() }()
 
 	// Factory function
 	factory := func(addr string) (anet.PoolItem, error) {
@@ -26,6 +26,7 @@ func TestTaskPoolingSafety(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
+
 		return conn, nil
 	}
 
@@ -59,7 +60,7 @@ func TestTaskPoolingSafety(t *testing.T) {
 
 	for i := 0; i < numRequests; i++ {
 		wg.Add(1)
-		go func(id int) {
+		go func(_ int) {
 			defer wg.Done()
 
 			msg := []byte("test message")
@@ -81,7 +82,7 @@ func TestTaskPoolingSafety(t *testing.T) {
 	close(errors)
 
 	// Check for any errors
-	var errorList []error
+	errorList := make([]error, 0, numRequests)
 	for err := range errors {
 		errorList = append(errorList, err)
 	}
@@ -95,14 +96,14 @@ func TestTaskPoolingSafety(t *testing.T) {
 	<-done
 }
 
-// TestTaskReferenceCountingEdgeCases tests edge cases in task reference counting
+// TestTaskReferenceCountingEdgeCases tests edge cases in task reference counting.
 func TestTaskReferenceCountingEdgeCases(t *testing.T) {
 	t.Parallel()
 
 	// Create test server
 	addr, stop, err := StartTestServer()
 	require.NoError(t, err)
-	defer stop()
+	defer func() { _ = stop() }()
 
 	// Factory function
 	factory := func(addr string) (anet.PoolItem, error) {
@@ -110,6 +111,7 @@ func TestTaskReferenceCountingEdgeCases(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
+
 		return conn, nil
 	}
 
@@ -156,14 +158,14 @@ func TestTaskReferenceCountingEdgeCases(t *testing.T) {
 	<-done
 }
 
-// BenchmarkTaskPoolingPerformance benchmarks the performance improvement from task pooling
+// BenchmarkTaskPoolingPerformance benchmarks the performance improvement from task pooling.
 func BenchmarkTaskPoolingPerformance(b *testing.B) {
 	// Create test server
 	addr, stop, err := StartTestServer()
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer stop()
+	defer func() { _ = stop() }()
 
 	// Factory function
 	factory := func(addr string) (anet.PoolItem, error) {
@@ -171,6 +173,7 @@ func BenchmarkTaskPoolingPerformance(b *testing.B) {
 		if err != nil {
 			return nil, err
 		}
+
 		return conn, nil
 	}
 

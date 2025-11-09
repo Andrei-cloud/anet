@@ -89,6 +89,9 @@ type pendingTable struct {
 	}
 }
 
+// NoopLogger provides a default no-op logger.
+type NoopLogger struct{}
+
 func (p *pendingTable) shard(id uint32) *struct {
 	mu sync.Mutex
 	m  map[uint32]*Task
@@ -150,9 +153,6 @@ func (p *pendingTable) ForEachAndClear(fn func(id uint32, t *Task)) {
 		}
 	}
 }
-
-// NoopLogger provides a default no-op logger.
-type NoopLogger struct{}
 
 // DefaultBrokerConfig returns the default broker configuration.
 func DefaultBrokerConfig() *BrokerConfig {
@@ -362,7 +362,7 @@ func (b *broker) loop(_ int) error {
 	}
 }
 
-// processTask handles a single task with proper reference counting for safe pooling
+// processTask handles a single task with proper reference counting for safe pooling.
 func (b *broker) processTask(task *Task) {
 	// Add reference for worker goroutine access
 	task.addRef()
@@ -405,6 +405,7 @@ func (b *broker) processTask(task *Task) {
 		}
 		b.trySendError(task, fmt.Errorf("failed to get connection: %w", err))
 		b.failPending(task)
+
 		return
 	}
 

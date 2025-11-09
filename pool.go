@@ -11,20 +11,20 @@ import (
 	"time"
 )
 
+const (
+	// ValidationNone disables connection validation.
+	ValidationNone ValidationStrategy = "none"
+	// ValidationPing sends a simple ping to validate connection.
+	ValidationPing ValidationStrategy = "ping"
+	// ValidationRead attempts to read with timeout to validate connection.
+	ValidationRead ValidationStrategy = "read"
+)
+
 // ErrClosing indicates the pool is shutting down.
 var ErrClosing = errors.New("pool is closing")
 
-// ValidationStrategy defines how connections should be validated
+// ValidationStrategy defines how connections should be validated.
 type ValidationStrategy string
-
-const (
-	// ValidationNone disables connection validation
-	ValidationNone ValidationStrategy = "none"
-	// ValidationPing sends a simple ping to validate connection
-	ValidationPing ValidationStrategy = "ping"
-	// ValidationRead attempts to read with timeout to validate connection
-	ValidationRead ValidationStrategy = "read"
-)
 
 // PoolConfig contains configuration options for a connection pool.
 type PoolConfig struct {
@@ -157,7 +157,7 @@ func (p *pool) validateConnectionSubset() {
 	// Only validate a small subset to avoid performance impact
 	maxToCheck := 5 // Limit validation to avoid overhead
 checkLoop:
-	for i := 0; i < maxToCheck; i++ {
+	for range maxToCheck {
 		select {
 		case item := <-p.queue:
 			if item == nil {
@@ -365,14 +365,14 @@ func (p *pool) validateConnection(item PoolItem) bool {
 	// Restore deadline after validation
 	defer func() {
 		// Reset deadline to no timeout
-		conn.SetDeadline(time.Time{})
+		_ = conn.SetDeadline(time.Time{})
 	}()
 
 	return p.validateConnectionWithStrategy(item)
 }
 
 // validateConnectionBasic performs basic validation without timeout support.
-func (p *pool) validateConnectionBasic(item PoolItem) bool {
+func (p *pool) validateConnectionBasic(_ PoolItem) bool {
 	switch p.config.ValidationStrategy {
 	case ValidationNone:
 		return true
@@ -420,7 +420,7 @@ func (p *pool) validateConnectionWithStrategy(item PoolItem) bool {
 
 	// Log validation failure if we have a logger
 	if p.logger != nil {
-		fmt.Fprintf(p.logger, "Connection validation failed after %d attempts: %v\n",
+		_, _ = fmt.Fprintf(p.logger, "Connection validation failed after %d attempts: %v\n",
 			p.config.MaxValidationAttempts, lastErr)
 	}
 
@@ -436,9 +436,9 @@ func (p *pool) validatePing(item PoolItem) error {
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			// Use a 1-byte buffer to check connection state
 			var b [1]byte
-			tcpConn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+			_ = tcpConn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
 			n, err := tcpConn.Read(b[:])
-			tcpConn.SetReadDeadline(time.Time{}) // Reset deadline
+			_ = tcpConn.SetReadDeadline(time.Time{}) // Reset deadline
 
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -474,8 +474,8 @@ func (p *pool) validateRead(item PoolItem) error {
 	// Try to read with a very short deadline
 	if conn, ok := item.(net.Conn); ok {
 		oldDeadline := time.Now().Add(p.config.ValidationTimeout)
-		conn.SetReadDeadline(oldDeadline)
-		defer conn.SetReadDeadline(time.Time{}) // Reset deadline
+		_ = conn.SetReadDeadline(oldDeadline)
+		defer func() { _ = conn.SetReadDeadline(time.Time{}) }() // Reset deadline
 	}
 
 	// Attempt to read a single byte
