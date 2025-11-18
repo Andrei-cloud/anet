@@ -207,8 +207,11 @@ func (p *pool) Get() (PoolItem, error) {
 	}
 
 	// Try to create a new connection if under capacity.
-	current := p.count.Load()
-	if current < p.capacity {
+	for {
+		current := p.count.Load()
+		if current >= p.capacity {
+			break
+		}
 		if p.count.CompareAndSwap(current, current+1) {
 			item, err := p.factoryFunc(p.addr)
 			if err != nil {
@@ -218,6 +221,7 @@ func (p *pool) Get() (PoolItem, error) {
 
 			return item, nil
 		}
+		// CAS failed, retry loop
 	}
 
 	// Wait for a connection to become available.
@@ -247,8 +251,11 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 	}
 
 	// Try to create a new connection if under capacity
-	current := p.count.Load()
-	if current < p.capacity {
+	for {
+		current := p.count.Load()
+		if current >= p.capacity {
+			break
+		}
 		if p.count.CompareAndSwap(current, current+1) {
 			item, err := p.factoryFunc(p.addr)
 			if err != nil {
@@ -258,6 +265,7 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 
 			return item, nil
 		}
+		// CAS failed, retry loop
 	}
 
 	// Wait for an available connection or context cancellation
@@ -451,8 +459,9 @@ func (p *pool) validatePing(item PoolItem) error {
 
 			if n > 0 {
 				// Unexpected data - this might indicate a protocol issue
-				// But the connection is alive, so return success
-				return nil
+				// The connection is alive, but has unexpected data.
+				// We should consider it invalid to avoid protocol desync.
+				return fmt.Errorf("unexpected data during ping validation")
 			}
 		}
 	}
@@ -492,9 +501,9 @@ func (p *pool) validateRead(item PoolItem) error {
 
 	if n > 0 {
 		// We read data, which means the connection is alive
-		// In a real implementation, we might need to handle this data properly
-		// For validation purposes, we consider this successful
-		return nil
+		// However, for a request-response protocol, idle connections shouldn't have data.
+		// We consider this a validation failure to prevent protocol desync.
+		return fmt.Errorf("unexpected data during read validation")
 	}
 
 	return nil

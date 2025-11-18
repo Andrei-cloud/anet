@@ -16,13 +16,14 @@ const (
 )
 
 type ServerConfig struct {
-	ReadTimeout       time.Duration // maximum duration for read operations.
-	WriteTimeout      time.Duration // maximum duration for write operations.
-	IdleTimeout       time.Duration // duration a connection can remain idle.
-	MaxConns          int           // maximum concurrent connections allowed.
-	ShutdownTimeout   time.Duration // grace period for shutdown wait.
-	KeepAliveInterval time.Duration // interval for TCP keepalive probes.
-	Logger            anet.Logger   // optional logger for server events.
+	ReadTimeout           time.Duration // maximum duration for read operations.
+	WriteTimeout          time.Duration // maximum duration for write operations.
+	IdleTimeout           time.Duration // duration a connection can remain idle.
+	MaxConns              int           // maximum concurrent connections allowed.
+	MaxConcurrentHandlers int           // maximum concurrent message handlers allowed.
+	ShutdownTimeout       time.Duration // grace period for shutdown wait.
+	KeepAliveInterval     time.Duration // interval for TCP keepalive probes.
+	Logger                anet.Logger   // optional logger for server events.
 }
 
 func (c *ServerConfig) applyDefaults() {

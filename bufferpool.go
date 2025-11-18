@@ -63,6 +63,20 @@ func newBufferPool() *bufferPool {
 	return bp
 }
 
+// GetBuffer retrieves a buffer from the pool that is at least size bytes.
+// If no suitable buffer exists in the pool, a new one will be allocated.
+// The returned buffer may be larger than requested but will be at least size bytes.
+func GetBuffer(size int) []byte {
+	return globalBufferPool.getBuffer(size)
+}
+
+// PutBuffer returns a buffer to the pool for future reuse.
+// Buffers larger than maxBufferSize are not pooled to prevent memory bloat.
+// The buffer should not be accessed after being returned to the pool.
+func PutBuffer(buf []byte) {
+	globalBufferPool.putBuffer(buf)
+}
+
 // getBuffer retrieves a buffer from the pool that is at least size bytes.
 // If no suitable buffer exists in the pool, a new one will be allocated.
 // The returned buffer may be larger than requested but will be at least size bytes.

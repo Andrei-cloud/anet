@@ -9,11 +9,6 @@ import (
 	"github.com/andrei-cloud/anet"
 )
 
-// placeholder buffer pools (NUMA stub): one pool of 8KB capacity.
-var numaPools = []*sync.Pool{
-	{New: func() any { return make([]byte, 0, 8192) }},
-}
-
 type Server struct {
 	address     string         // network address to listen on.
 	listener    net.Listener   // TCP listener for incoming connections.
@@ -22,11 +17,7 @@ type Server struct {
 	activeConns sync.Map       // registry of active connections.
 	connWG      sync.WaitGroup // tracks active connection goroutines.
 	stopChan    chan struct{}  // signals server shutdown.
-}
-
-// getLocalPool returns the pool for message frames.
-func getLocalPool() *sync.Pool {
-	return numaPools[0]
+	handlerSem  chan struct{}  // semaphore to limit concurrent handlers.
 }
 
 func NewServer(address string, handler Handler, config *ServerConfig) (*Server, error) {
@@ -38,12 +29,18 @@ func NewServer(address string, handler Handler, config *ServerConfig) (*Server, 
 	}
 	config.applyDefaults()
 
-	return &Server{
+	s := &Server{
 		address:  address,
 		config:   config,
 		handler:  handler,
 		stopChan: make(chan struct{}),
-	}, nil
+	}
+
+	if config.MaxConcurrentHandlers > 0 {
+		s.handlerSem = make(chan struct{}, config.MaxConcurrentHandlers)
+	}
+
+	return s, nil
 }
 
 func (s *Server) Start() error {
@@ -194,7 +191,19 @@ func (s *Server) connectionLoop(sc *ServerConn) {
 }
 
 func (s *Server) dispatchMessage(sc *ServerConn, taskID, request []byte) {
+	// Acquire semaphore if configured
+	if s.handlerSem != nil {
+		// Blocking here provides backpressure to the connection reader loop.
+		s.handlerSem <- struct{}{}
+	}
+
 	go func() {
+		defer func() {
+			if s.handlerSem != nil {
+				<-s.handlerSem
+			}
+		}()
+
 		resp, err := s.handler.HandleMessage(sc, request)
 		if err != nil {
 			s.logf("handler error: %v", err)
@@ -205,17 +214,19 @@ func (s *Server) dispatchMessage(sc *ServerConn, taskID, request []byte) {
 		}
 
 		// reuse buffer for taskID+resp to reduce allocations.
-		//nolint:errcheck // sync.Pool.Get() doesn't return an error
-		obj := getLocalPool().Get()
-		buf, ok := obj.([]byte)
-		if !ok {
-			buf = make([]byte, 0, 8192)
-		}
 		required := len(taskID) + len(resp)
+		buf := anet.GetBuffer(required)
+
+		// Ensure buffer has enough capacity (GetBuffer guarantees at least required size)
+		// But GetBuffer returns a slice with len=required if it allocated new,
+		// or len=poolSize if from pool.
+		// We need to reslice to required length.
 		if cap(buf) < required {
+			// Should not happen if GetBuffer works as documented
 			buf = make([]byte, required)
 		}
 		buf = buf[:required]
+
 		copy(buf[:4], taskID)
 		copy(buf[4:], resp)
 
@@ -230,8 +241,7 @@ func (s *Server) dispatchMessage(sc *ServerConn, taskID, request []byte) {
 		sc.writeMu.Unlock()
 
 		// return buffer to pool.
-		//nolint:staticcheck // passing slice which is pointer-like
-		getLocalPool().Put(buf[:0])
+		anet.PutBuffer(buf)
 
 		if writeErr != nil {
 			s.logf("write error: %v", writeErr)
