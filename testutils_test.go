@@ -104,7 +104,7 @@ func StartTestServer() (string, func() error, error) {
 
 				return
 			}
-			requestMsg, err := anet.Read(conn)
+			requestMsg, err := anet.ReadPooled(conn)
 			if err != nil {
 				if err != io.EOF && !errors.Is(err, net.ErrClosed) {
 					if ne, ok := err.(net.Error); ok && ne.Temporary() {
@@ -125,10 +125,11 @@ func StartTestServer() (string, func() error, error) {
 				if logVerbose && !errors.Is(err, net.ErrClosed) {
 					log.Printf("Test server set write deadline error: %v", err)
 				}
-
+				anet.PutBuffer(requestMsg)
 				return
 			}
 			err = anet.Write(conn, requestMsg)
+			anet.PutBuffer(requestMsg)
 			if err != nil {
 				if !errors.Is(err, net.ErrClosed) {
 					if ne, ok := err.(net.Error); ok && ne.Temporary() {

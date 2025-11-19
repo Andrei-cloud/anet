@@ -175,3 +175,50 @@ func Read(r io.Reader) ([]byte, error) {
 
 	return payload, nil
 }
+
+// ReadPooled receives data using the message framing protocol, allocating the
+// payload buffer from the global buffer pool. The caller is responsible for
+// returning the buffer to the pool using PutBuffer.
+func ReadPooled(r io.Reader) ([]byte, error) {
+	// Read the length header into a small stack buffer.
+	var hdr [LENGTHSIZE]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
+	}
+
+	// Parse the length value.
+	var length uint64
+	switch LENGTHSIZE {
+	case 2:
+		length = uint64(binary.BigEndian.Uint16(hdr[:]))
+	case 4:
+		length = uint64(binary.BigEndian.Uint32(hdr[:]))
+	default:
+		return nil, fmt.Errorf("unsupported header size: %d", LENGTHSIZE)
+	}
+
+	if length == 0 {
+		return []byte{}, nil
+	}
+
+	// Get a buffer from the pool.
+	// Note: GetBuffer returns a slice with len=size if allocated new,
+	// or len=poolSize if from pool. We need to ensure we read exactly 'length'.
+	// But GetBuffer guarantees cap >= size.
+	buf := GetBuffer(int(length))
+
+	// Reslice to exact length needed for ReadFull
+	if cap(buf) < int(length) {
+		// Should not happen if GetBuffer works correctly
+		buf = make([]byte, length)
+	}
+	payload := buf[:length]
+
+	if _, err := io.ReadFull(r, payload); err != nil {
+		// Return buffer to pool on error if we managed to get one
+		PutBuffer(buf)
+		return nil, err
+	}
+
+	return payload, nil
+}

@@ -37,7 +37,7 @@ func (m *mockBasicItem) Close() error {
 
 func newMockValidationConn() *mockValidationConn {
 	return &mockValidationConn{
-		data: []byte("test data"),
+		data: []byte{}, // Default to empty data (idle connection)
 	}
 }
 

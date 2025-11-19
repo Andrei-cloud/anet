@@ -39,6 +39,8 @@ type Task struct {
 	optimized bool            // Tracks whether task uses pooled memory (for cleanup)
 	pooled    bool            // Tracks whether task struct and channels are pooled
 	refCount  int32           // Reference count for safe pooling (atomic)
+	cmdBuf    []byte          // Reusable buffer for command serialization
+	writeBufs [][]byte        // Reusable slice for net.Buffers (writev)
 }
 
 // newTaskIDPool creates a new task ID pool with the specified size.

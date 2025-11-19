@@ -68,7 +68,6 @@ type broker struct {
 	compool      []Pool
 	requestQueue chan *Task // Use blocking channel instead of RingBuffer
 	pending      pendingTable
-	activeConns  sync.Map
 	//nolint:containedctx // Necessary for task cancellation within broker queue.
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -193,7 +192,10 @@ func NewBroker(p []Pool, n int, l Logger, config *BrokerConfig) Broker {
 	// Initialize object pools for memory optimization
 	b.taskPool = sync.Pool{
 		New: func() any {
-			return &Task{}
+			return &Task{
+				response: make(chan []byte, 1),
+				errCh:    make(chan error, 1),
+			}
 		},
 	}
 
@@ -430,18 +432,23 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 	}
 
 	// Capture task ID to avoid race condition with task reuse
-	taskID := task.id
+	// taskID := task.id
 
-	// sync.Map is already thread-safe, no additional locking needed
-	b.activeConns.Store(taskID, netConn)
+	// activeConns was write-only and unused for logic, removed for performance.
+	// b.activeConns.Store(taskID, netConn)
+	// defer func() { b.activeConns.Delete(taskID) }()
 
-	defer func() {
-		b.activeConns.Delete(taskID)
-	}()
+	// Prepare header in task.cmdBuf to avoid allocation
+	header := task.cmdBuf
+	payloadLen := taskIDSize + len(*task.request)
 
-	cmd := b.addTask(task)
-	// Ensure command buffer is returned to pool after use.
-	defer func() { globalBufferPool.putBuffer(cmd) }()
+	switch LENGTHSIZE {
+	case 2:
+		binary.BigEndian.PutUint16(header[0:2], uint16(payloadLen))
+	case 4:
+		binary.BigEndian.PutUint32(header[0:4], uint32(payloadLen))
+	}
+	copy(header[LENGTHSIZE:], task.taskID)
 
 	if b.closing.Load() {
 		b.trySendError(task, ErrClosingBroker)
@@ -458,7 +465,12 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 		return err
 	}
 
-	if err := Write(netConn, cmd); err != nil {
+	// Use net.Buffers for zero-copy write
+	task.writeBufs[0] = header
+	task.writeBufs[1] = *task.request
+	bufs := net.Buffers(task.writeBufs)
+
+	if _, err := bufs.WriteTo(netConn); err != nil {
 		b.trySendError(task, fmt.Errorf("writing to connection: %w", err))
 		b.failPending(task)
 
@@ -559,8 +571,9 @@ func (b *broker) returnTaskToPool(task *Task) {
 		// Zero out fields to prevent memory leaks and return the Task struct
 		task.ctx = nil
 		task.request = nil
-		task.response = nil
-		task.errCh = nil
+		// Keep channels for reuse
+		// task.response = nil
+		// task.errCh = nil
 		task.optimized = false
 		task.pooled = false
 		task.refCount = 0
@@ -585,39 +598,44 @@ func (b *broker) newTask(ctx context.Context, r *[]byte) *Task {
 	// Get pooled Task struct to reduce allocations (now with safe reference counting)
 	task, ok := b.taskPool.Get().(*Task)
 	if !ok {
-		task = &Task{}
+		task = &Task{
+			response:  make(chan []byte, 1),
+			errCh:     make(chan error, 1),
+			cmdBuf:    make([]byte, LENGTHSIZE+taskIDSize),
+			writeBufs: make([][]byte, 2),
+		}
+	} else {
+		if cap(task.cmdBuf) < LENGTHSIZE+taskIDSize {
+			task.cmdBuf = make([]byte, LENGTHSIZE+taskIDSize)
+		}
+		if cap(task.writeBufs) < 2 {
+			task.writeBufs = make([][]byte, 2)
+		}
 	}
-	// Fresh channels per task to avoid reuse/close races
-	respCh := make(chan []byte, 1)
-	errCh := make(chan error, 1)
+	task.cmdBuf = task.cmdBuf[:LENGTHSIZE+taskIDSize]
+	task.writeBufs = task.writeBufs[:2]
+
+	// Drain channels to ensure they are empty before reuse
+	select {
+	case <-task.response:
+	default:
+	}
+	select {
+	case <-task.errCh:
+	default:
+	}
 
 	// Initialize the task
 	task.ctx = ctx
 	task.id = id
 	task.taskID = taskIDBytes
+	// task.response and task.errCh are already set and drained
 	task.request = r
-	task.response = respCh
-	task.errCh = errCh
 	task.optimized = b.config != nil && b.config.OptimizeMemory
 	task.pooled = true
 	task.refCount = 1 // Initial reference for the caller
 
 	return task
-}
-
-func (b *broker) addTask(task *Task) []byte {
-	totalSize := taskIDSize + len(*task.request)
-
-	// Use buffer pool for command allocation to reduce GC pressure
-	cmd := globalBufferPool.getBuffer(totalSize)
-	if len(cmd) > totalSize {
-		cmd = cmd[:totalSize] // Trim to exact size needed
-	}
-
-	copy(cmd[:taskIDSize], task.taskID)
-	copy(cmd[taskIDSize:], *task.request)
-
-	return cmd
 }
 
 // Close shuts down the broker, canceling context and waiting for workers to exit.

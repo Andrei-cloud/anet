@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/binary"
 	"errors"
 	"net"
 	"sync"
@@ -168,7 +169,7 @@ func (s *Server) connectionLoop(sc *ServerConn) {
 			}
 		}
 
-		msg, err := anet.Read(sc.Conn)
+		msg, err := anet.ReadPooled(sc.Conn)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				s.logf("closing idle connection: %v", sc.Conn.RemoteAddr())
@@ -179,18 +180,18 @@ func (s *Server) connectionLoop(sc *ServerConn) {
 
 		if len(msg) < 4 {
 			s.logf("protocol error: message too short")
-
+			anet.PutBuffer(msg) // Return buffer if invalid
 			return
 		}
 
 		taskID := msg[:4]
 		payload := msg[4:]
 
-		s.dispatchMessage(sc, taskID, payload)
+		s.dispatchMessage(sc, taskID, payload, msg)
 	}
 }
 
-func (s *Server) dispatchMessage(sc *ServerConn, taskID, request []byte) {
+func (s *Server) dispatchMessage(sc *ServerConn, taskID, request, originalBuf []byte) {
 	// Acquire semaphore if configured
 	if s.handlerSem != nil {
 		// Blocking here provides backpressure to the connection reader loop.
@@ -202,6 +203,7 @@ func (s *Server) dispatchMessage(sc *ServerConn, taskID, request []byte) {
 			if s.handlerSem != nil {
 				<-s.handlerSem
 			}
+			anet.PutBuffer(originalBuf)
 		}()
 
 		resp, err := s.handler.HandleMessage(sc, request)
@@ -214,7 +216,7 @@ func (s *Server) dispatchMessage(sc *ServerConn, taskID, request []byte) {
 		}
 
 		// reuse buffer for taskID+resp to reduce allocations.
-		required := len(taskID) + len(resp)
+		required := anet.LENGTHSIZE + len(taskID) + len(resp)
 		buf := anet.GetBuffer(required)
 
 		// Ensure buffer has enough capacity (GetBuffer guarantees at least required size)
@@ -227,8 +229,16 @@ func (s *Server) dispatchMessage(sc *ServerConn, taskID, request []byte) {
 		}
 		buf = buf[:required]
 
-		copy(buf[:4], taskID)
-		copy(buf[4:], resp)
+		// Write header directly to avoid net.Buffers allocation in Write
+		switch anet.LENGTHSIZE {
+		case 2:
+			binary.BigEndian.PutUint16(buf[0:2], uint16(len(taskID)+len(resp)))
+		case 4:
+			binary.BigEndian.PutUint32(buf[0:4], uint32(len(taskID)+len(resp)))
+		}
+
+		copy(buf[anet.LENGTHSIZE:anet.LENGTHSIZE+4], taskID)
+		copy(buf[anet.LENGTHSIZE+4:], resp)
 
 		sc.writeMu.Lock()
 		if s.config.WriteTimeout > 0 {
@@ -237,7 +247,7 @@ func (s *Server) dispatchMessage(sc *ServerConn, taskID, request []byte) {
 			}
 		}
 
-		writeErr := anet.Write(sc.Conn, buf)
+		_, writeErr := sc.Conn.Write(buf)
 		sc.writeMu.Unlock()
 
 		// return buffer to pool.
