@@ -67,7 +67,6 @@ type broker struct {
 	workers      int
 	compool      []Pool
 	requestQueue chan *Task // Use blocking channel instead of RingBuffer
-	pending      pendingTable
 	//nolint:containedctx // Necessary for task cancellation within broker queue.
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -79,79 +78,8 @@ type broker struct {
 	taskPool sync.Pool     // Pool for Task structs
 }
 
-// pendingTable is a sharded map to store pending tasks by ID with lower
-// allocation and contention overhead than sync.Map for our access pattern.
-type pendingTable struct {
-	shards [pendingShards]struct {
-		mu sync.Mutex
-		m  map[uint32]*Task
-	}
-}
-
 // NoopLogger provides a default no-op logger.
 type NoopLogger struct{}
-
-func (p *pendingTable) shard(id uint32) *struct {
-	mu sync.Mutex
-	m  map[uint32]*Task
-} {
-	return &p.shards[id&(pendingShards-1)]
-}
-
-func (p *pendingTable) Store(id uint32, t *Task) {
-	s := p.shard(id)
-	s.mu.Lock()
-	if s.m == nil {
-		s.m = make(map[uint32]*Task)
-	}
-	s.m[id] = t
-	s.mu.Unlock()
-}
-
-func (p *pendingTable) Load(id uint32) (*Task, bool) {
-	s := p.shard(id)
-	s.mu.Lock()
-	t, ok := s.m[id]
-	s.mu.Unlock()
-
-	return t, ok
-}
-
-func (p *pendingTable) Delete(id uint32) {
-	s := p.shard(id)
-	s.mu.Lock()
-	if s.m != nil {
-		delete(s.m, id)
-	}
-	s.mu.Unlock()
-}
-
-// ForEachAndClear applies fn to each entry, then clears the table.
-func (p *pendingTable) ForEachAndClear(fn func(id uint32, t *Task)) {
-	for i := range p.shards {
-		s := &p.shards[i]
-		s.mu.Lock()
-		if len(s.m) == 0 {
-			s.mu.Unlock()
-			continue
-		}
-		// Snapshot current entries, then clear under lock.
-		type kv struct {
-			id uint32
-			t  *Task
-		}
-		snap := make([]kv, 0, len(s.m))
-		for id, t := range s.m {
-			snap = append(snap, kv{id: id, t: t})
-		}
-		s.m = make(map[uint32]*Task)
-		s.mu.Unlock()
-		// Invoke callback outside the lock to avoid deadlocks.
-		for _, e := range snap {
-			fn(e.id, e.t)
-		}
-	}
-}
 
 // DefaultBrokerConfig returns the default broker configuration.
 func DefaultBrokerConfig() *BrokerConfig {
@@ -221,14 +149,12 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 	if b.closing.Load() {
 		return nil, ErrClosingBroker
 	}
-	b.pending.Store(task.id, task)
 	// Use non-blocking channel send - fail if queue is full or broker closing
 	select {
 	case b.requestQueue <- task:
 		// Successfully queued
 	default:
 		// Queue full or broker closing
-		b.failPending(task)
 		if b.closing.Load() || b.ctx.Err() != nil {
 			return nil, ErrClosingBroker
 		}
@@ -238,7 +164,6 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 	select {
 	case resp := <-task.response:
 		// Success path: cleanup here to avoid racing with responder goroutines.
-		b.pending.Delete(task.id)
 		if task.optimized {
 			globalTaskIDPool.putTaskID(task.taskID)
 		}
@@ -248,7 +173,6 @@ func (b *broker) Send(req *[]byte) ([]byte, error) {
 		return resp, nil
 	case err := <-task.errCh:
 		// Error path: perform cleanup symmetrically.
-		b.pending.Delete(task.id)
 		if task.optimized {
 			globalTaskIDPool.putTaskID(task.taskID)
 		}
@@ -264,18 +188,14 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 	if b.closing.Load() {
 		return nil, ErrClosingBroker
 	}
-	b.pending.Store(task.id, task)
 	// Use non-blocking channel send with context checking
 	select {
 	case b.requestQueue <- task:
 		// Successfully queued
 	case <-ctx.Done():
-		b.failPending(task)
-
 		return nil, ctx.Err()
 	default:
 		// Queue full or broker closing
-		b.failPending(task)
 		if b.closing.Load() || b.ctx.Err() != nil {
 			return nil, ErrClosingBroker
 		}
@@ -288,7 +208,6 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 	select {
 	case resp := <-task.response:
 		// Success path: cleanup here to avoid racing with responder goroutines.
-		b.pending.Delete(task.id)
 		if task.optimized {
 			globalTaskIDPool.putTaskID(task.taskID)
 		}
@@ -297,7 +216,6 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 		return resp, nil
 	case err := <-task.errCh:
 		// Error path: perform cleanup symmetrically.
-		b.pending.Delete(task.id)
 		if task.optimized {
 			globalTaskIDPool.putTaskID(task.taskID)
 		}
@@ -306,7 +224,6 @@ func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
 		return nil, err
 	case <-ctx.Done():
 		// Context canceled: signal handled by worker or here; ensure cleanup.
-		b.pending.Delete(task.id)
 		if task.optimized {
 			globalTaskIDPool.putTaskID(task.taskID)
 		}
@@ -373,7 +290,6 @@ func (b *broker) processTask(task *Task) {
 	// Check closing status without context - faster atomic check
 	if b.closing.Load() {
 		b.trySendError(task, ErrClosingBroker)
-		b.failPending(task)
 		return
 	}
 
@@ -385,7 +301,7 @@ func (b *broker) processTask(task *Task) {
 
 	if p == nil {
 		b.trySendError(task, ErrNoPoolsAvailable)
-		b.failPending(task)
+		// b.failPending(task) // No longer needed
 		return
 	}
 
@@ -402,11 +318,11 @@ func (b *broker) processTask(task *Task) {
 		// Only check context error after operation failure
 		if taskCtx != nil && errors.Is(err, taskCtx.Err()) {
 			b.trySendError(task, taskCtx.Err())
-			b.failPending(task)
+			// b.failPending(task) // No longer needed
 			return
 		}
 		b.trySendError(task, fmt.Errorf("failed to get connection: %w", err))
-		b.failPending(task)
+		// b.failPending(task) // No longer needed
 
 		return
 	}
@@ -414,7 +330,7 @@ func (b *broker) processTask(task *Task) {
 	err = b.handleConnection(task, wr)
 	if err != nil {
 		p.Release(wr)
-		b.failPending(task)
+		// b.failPending(task) // No longer needed
 		return
 	}
 
@@ -426,7 +342,7 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 	if !ok {
 		err := errors.New("internal error: pool item is not net.Conn")
 		b.trySendError(task, err)
-		b.failPending(task)
+		// b.failPending(task) // No longer needed
 
 		return err
 	}
@@ -452,17 +368,20 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 
 	if b.closing.Load() {
 		b.trySendError(task, ErrClosingBroker)
-		b.failPending(task)
+		// b.failPending(task) // No longer needed
 
 		return ErrClosingBroker
 	}
 
-	writeDeadline := time.Now().Add(b.config.WriteTimeout)
-	if err := netConn.SetWriteDeadline(writeDeadline); err != nil {
-		b.trySendError(task, fmt.Errorf("setting write deadline: %w", err))
-		b.failPending(task)
+	// Optimization: Only set write deadline if configured
+	if b.config.WriteTimeout > 0 {
+		writeDeadline := time.Now().Add(b.config.WriteTimeout)
+		if err := netConn.SetWriteDeadline(writeDeadline); err != nil {
+			b.trySendError(task, fmt.Errorf("setting write deadline: %w", err))
+			// b.failPending(task) // No longer needed
 
-		return err
+			return err
+		}
 	}
 
 	// Use net.Buffers for zero-copy write
@@ -472,7 +391,7 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 
 	if _, err := bufs.WriteTo(netConn); err != nil {
 		b.trySendError(task, fmt.Errorf("writing to connection: %w", err))
-		b.failPending(task)
+		// b.failPending(task) // No longer needed
 
 		return err
 	}
@@ -489,10 +408,11 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 			}
 		}
 	}
+	// Optimization: Only set read deadline if it's not zero
 	if !readDeadline.IsZero() {
 		if err := netConn.SetReadDeadline(readDeadline); err != nil {
 			b.trySendError(task, fmt.Errorf("setting read deadline: %w", err))
-			b.failPending(task)
+			// b.failPending(task) // No longer needed
 
 			return err
 		}
@@ -503,13 +423,34 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 	if err != nil {
 		wrappedErr := fmt.Errorf("reading from connection: %w", err)
 		b.trySendError(task, wrappedErr)
-		b.failPending(task)
+		// b.failPending(task) // No longer needed
 
 		return wrappedErr
 	}
-	b.respondPending(resp)
 
-	_ = netConn.SetDeadline(time.Time{})
+	// Verify Task ID matches
+	if len(resp) < taskIDSize {
+		err := errors.New("response too short")
+		b.trySendError(task, err)
+		return err
+	}
+	respTaskID := binary.BigEndian.Uint32(resp[:taskIDSize])
+	if respTaskID != task.id {
+		err := fmt.Errorf("task ID mismatch: expected %d, got %d", task.id, respTaskID)
+		b.trySendError(task, err)
+		return err
+	}
+
+	// Deliver response directly
+	func() {
+		defer func() { _ = recover() }()
+		task.response <- resp[taskIDSize:]
+	}()
+
+	// Optimization: Do NOT reset the deadline here.
+	// The next user of this connection will overwrite the deadline anyway.
+	// This saves one syscall per request.
+	// _ = netConn.SetDeadline(time.Time{})
 
 	return nil
 }
@@ -535,29 +476,29 @@ func (b *broker) trySendError(task *Task, err error) {
 	}
 }
 
-func (b *broker) respondPending(resp []byte) {
-	if len(resp) < taskIDSize {
-		return
-	}
-	taskID := binary.BigEndian.Uint32(resp[:taskIDSize])
+// func (b *broker) respondPending(resp []byte) {
+// 	if len(resp) < taskIDSize {
+// 		return
+// 	}
+// 	taskID := binary.BigEndian.Uint32(resp[:taskIDSize])
 
-	if task, ok := b.pending.Load(taskID); ok {
-		// Deliver the response. Block until the receiver reads it.
-		// Do not delete pending or return task here; the waiting sender will
-		// perform cleanup after receiving to avoid races.
-		func() {
-			defer func() { _ = recover() }()
-			task.response <- resp[taskIDSize:]
-		}()
-	}
-}
+// 	if task, ok := b.pending.Load(taskID); ok {
+// 		// Deliver the response. Block until the receiver reads it.
+// 		// Do not delete pending or return task here; the waiting sender will
+// 		// perform cleanup after receiving to avoid races.
+// 		func() {
+// 			defer func() { _ = recover() }()
+// 			task.response <- resp[taskIDSize:]
+// 		}()
+// 	}
+// }
 
-func (b *broker) failPending(task *Task) {
-	// Pure logical cleanup: only remove from pending.
-	// Do NOT close channels or return the task; the waiting sender will
-	// receive an error (via trySendError) and perform cleanup safely.
-	b.pending.Delete(task.id)
-}
+// func (b *broker) failPending(task *Task) {
+// 	// Pure logical cleanup: only remove from pending.
+// 	// Do NOT close channels or return the task; the waiting sender will
+// 	// receive an error (via trySendError) and perform cleanup safely.
+// 	b.pending.Delete(task.id)
+// }
 
 // returnTaskToPool returns a Task and its channels back to the pools.
 // This is now safe due to reference counting - task is only pooled when refCount reaches 0.
@@ -651,7 +592,6 @@ func (b *broker) Close() {
 		case task := <-b.requestQueue:
 			if task != nil {
 				b.trySendError(task, ErrClosingBroker)
-				b.failPending(task)
 			}
 		default:
 			goto drained
@@ -660,12 +600,12 @@ func (b *broker) Close() {
 drained:
 
 	// Inform all pending tasks that we're closing
-	b.pending.ForEachAndClear(func(_ uint32, task *Task) {
-		if task != nil {
-			b.trySendError(task, ErrClosingBroker)
-			b.failPending(task)
-		}
-	})
+	// b.pending.ForEachAndClear(func(_ uint32, task *Task) {
+	// 	if task != nil {
+	// 		b.trySendError(task, ErrClosingBroker)
+	// 		b.failPending(task)
+	// 	}
+	// })
 
 	// Cancel broker context to stop workers and wait for them to exit
 	b.cancel()
