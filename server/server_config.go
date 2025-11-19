@@ -7,12 +7,13 @@ import (
 )
 
 const (
-	DefaultReadTimeout       = 5 * time.Second  // default read timeout duration.
-	DefaultWriteTimeout      = 5 * time.Second  // default write timeout duration.
-	DefaultIdleTimeout       = 0 * time.Second  // default idle timeout disables idle closure.
-	DefaultMaxConns          = 0                // default max connections means no limit.
-	DefaultShutdownTimeout   = 5 * time.Second  // default shutdown timeout duration.
-	DefaultKeepAliveInterval = 30 * time.Second // default TCP keepalive period.
+	DefaultReadTimeout           = 5 * time.Second  // default read timeout duration.
+	DefaultWriteTimeout          = 5 * time.Second  // default write timeout duration.
+	DefaultIdleTimeout           = 0 * time.Second  // default idle timeout disables idle closure.
+	DefaultMaxConns              = 0                // default max connections means no limit.
+	DefaultShutdownTimeout       = 5 * time.Second  // default shutdown timeout duration.
+	DefaultKeepAliveInterval     = 30 * time.Second // default TCP keepalive period.
+	DefaultMaxConcurrentHandlers = 10000            // default max concurrent handlers.
 )
 
 type ServerConfig struct {
@@ -41,5 +42,9 @@ func (c *ServerConfig) applyDefaults() {
 
 	if c.KeepAliveInterval == 0 {
 		c.KeepAliveInterval = DefaultKeepAliveInterval
+	}
+
+	if c.MaxConcurrentHandlers == 0 {
+		c.MaxConcurrentHandlers = DefaultMaxConcurrentHandlers
 	}
 }

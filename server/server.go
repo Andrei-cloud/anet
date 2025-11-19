@@ -5,20 +5,22 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/andrei-cloud/anet"
 )
 
 type Server struct {
-	address     string         // network address to listen on.
-	listener    net.Listener   // TCP listener for incoming connections.
-	config      *ServerConfig  // server configuration options.
-	handler     Handler        // handler to process incoming messages.
-	activeConns sync.Map       // registry of active connections.
-	connWG      sync.WaitGroup // tracks active connection goroutines.
-	stopChan    chan struct{}  // signals server shutdown.
-	handlerSem  chan struct{}  // semaphore to limit concurrent handlers.
+	address         string         // network address to listen on.
+	listener        net.Listener   // TCP listener for incoming connections.
+	config          *ServerConfig  // server configuration options.
+	handler         Handler        // handler to process incoming messages.
+	activeConns     sync.Map       // registry of active connections.
+	activeConnCount atomic.Int32   // atomic counter for active connections
+	connWG          sync.WaitGroup // tracks active connection goroutines.
+	stopChan        chan struct{}  // signals server shutdown.
+	handlerSem      chan struct{}  // semaphore to limit concurrent handlers.
 }
 
 func NewServer(address string, handler Handler, config *ServerConfig) (*Server, error) {
@@ -118,13 +120,7 @@ func (s *Server) acceptLoop() {
 		}
 
 		if s.config.MaxConns > 0 {
-			count := 0
-			s.activeConns.Range(func(_, _ any) bool {
-				count++
-
-				return true
-			})
-			if count >= s.config.MaxConns {
+			if int(s.activeConnCount.Load()) >= s.config.MaxConns {
 				if err := conn.Close(); err != nil {
 					s.logf("connection close error: %v", err)
 				}
@@ -138,6 +134,7 @@ func (s *Server) acceptLoop() {
 }
 
 func (s *Server) handleNewConnection(conn net.Conn) {
+	s.activeConnCount.Add(1)
 	sc := &ServerConn{Conn: conn, server: s}
 	sc.init()
 
@@ -149,6 +146,7 @@ func (s *Server) handleNewConnection(conn net.Conn) {
 
 func (s *Server) removeConnection(sc *ServerConn) {
 	s.activeConns.Delete(sc)
+	s.activeConnCount.Add(-1)
 }
 
 func (s *Server) connectionLoop(sc *ServerConn) {

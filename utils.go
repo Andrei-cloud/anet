@@ -108,6 +108,35 @@ func Write(w io.Writer, in []byte) error {
 		return ErrMaxLenExceeded
 	}
 
+	// Optimization: For small messages, copy to a single buffer to avoid
+	// the allocation overhead of net.Buffers (which allocates a slice).
+	// Threshold chosen empirically; copying < 512 bytes is cheaper than slice alloc + GC.
+	if len(in) < 512 {
+		totalLen := LENGTHSIZE + len(in)
+		buf := GetBuffer(totalLen)
+		// Ensure we return the buffer to the pool
+		defer PutBuffer(buf)
+
+		// Reslice to exact length
+		if cap(buf) >= totalLen {
+			buf = buf[:totalLen]
+		} else {
+			// Should not happen with GetBuffer, but safe fallback
+			buf = make([]byte, totalLen)
+		}
+
+		switch LENGTHSIZE {
+		case 2:
+			binary.BigEndian.PutUint16(buf[0:2], uint16(len(in)))
+		case 4:
+			binary.BigEndian.PutUint32(buf[0:4], uint32(len(in)))
+		}
+		copy(buf[LENGTHSIZE:], in)
+
+		_, err := w.Write(buf)
+		return err
+	}
+
 	// Build header in a small stack buffer to avoid allocations.
 	var hdr [LENGTHSIZE]byte
 	switch LENGTHSIZE {

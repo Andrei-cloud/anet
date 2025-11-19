@@ -20,7 +20,7 @@ func TestUtils(t *testing.T) {
 	// Create a test server for the entire test suite
 	addr, stop, err := StartTestServer()
 	require.NoError(t, err)
-	defer stop() // Clean up server after all tests complete
+	t.Cleanup(func() { stop() }) // Clean up server after all tests complete
 
 	// Sub-tests for specific functionality
 	t.Run("Write Success", func(t *testing.T) {
@@ -118,5 +118,68 @@ func TestUtils(t *testing.T) {
 		msg := make([]byte, 70000)
 		err = anet.Write(conn, msg)
 		require.ErrorIs(t, err, anet.ErrMaxLenExceeded)
+	})
+
+	t.Run("Write Small vs Large", func(t *testing.T) {
+		t.Parallel()
+
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err != nil {
+			t.Skipf("Skipping test due to connection error: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("Failed to set deadline: %v", err)
+		}
+
+		// Test small message (optimized path)
+		smallMsg := make([]byte, 100)
+		for i := range smallMsg {
+			smallMsg[i] = byte(i)
+		}
+		err = anet.Write(conn, smallMsg)
+		require.NoError(t, err)
+
+		readSmall, err := anet.Read(conn)
+		require.NoError(t, err)
+		require.Equal(t, smallMsg, readSmall)
+
+		// Test boundary message (511 bytes - optimized)
+		boundaryMsg1 := make([]byte, 511)
+		for i := range boundaryMsg1 {
+			boundaryMsg1[i] = byte(i)
+		}
+		err = anet.Write(conn, boundaryMsg1)
+		require.NoError(t, err)
+
+		readBoundary1, err := anet.Read(conn)
+		require.NoError(t, err)
+		require.Equal(t, boundaryMsg1, readBoundary1)
+
+		// Test boundary message (512 bytes - standard path)
+		boundaryMsg2 := make([]byte, 512)
+		for i := range boundaryMsg2 {
+			boundaryMsg2[i] = byte(i)
+		}
+		err = anet.Write(conn, boundaryMsg2)
+		require.NoError(t, err)
+
+		readBoundary2, err := anet.Read(conn)
+		require.NoError(t, err)
+		require.Equal(t, boundaryMsg2, readBoundary2)
+
+		// Test large message (standard path)
+		largeMsg := make([]byte, 2000)
+		for i := range largeMsg {
+			largeMsg[i] = byte(i)
+		}
+		err = anet.Write(conn, largeMsg)
+		require.NoError(t, err)
+
+		readLarge, err := anet.Read(conn)
+		require.NoError(t, err)
+		require.Equal(t, largeMsg, readLarge)
 	})
 }
