@@ -28,10 +28,10 @@
 //
 // Basic Server Example:
 //
-//	handler := server.HandlerFunc(func(c *anet.ServerConn, req []byte) ([]byte, error) {
+//	handler := server.HandlerFunc(func(c *server.ServerConn, req []byte) ([]byte, error) {
 //	    return req, nil
 //	})
-//	srv, err := anet.NewServer(":9000", handler, nil)
+//	srv, err := server.NewServer(":9000", handler, nil)
 //	if err != nil {
 //	    // handle error
 //	}
