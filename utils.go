@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 )
 
 // Message framing constants.
@@ -102,65 +101,45 @@ func (r *RingBuffer[T]) Cap() uint64 {
 //
 // Returns ErrMaxLenExceeded if the message is too large for the length header.
 func Write(w io.Writer, in []byte) error {
-	// Calculate maximum allowed length based on header size.
-	maxLen := uint64(1<<(8*LENGTHSIZE)) - 1
-	if uint64(len(in)) > maxLen {
+	payloadLen := len(in)
+	maxLen := (1 << (8 * LENGTHSIZE)) - 1
+	if payloadLen > maxLen {
 		return ErrMaxLenExceeded
 	}
 
-	// Optimization: For small messages, copy to a single buffer to avoid
-	// the allocation overhead of net.Buffers (which allocates a slice).
-	// Threshold chosen empirically; copying < 512 bytes is cheaper than slice alloc + GC.
-	if len(in) < 512 {
-		totalLen := LENGTHSIZE + len(in)
-		buf := GetBuffer(totalLen)
-		// Ensure we return the buffer to the pool
-		defer PutBuffer(buf)
+	totalLen := LENGTHSIZE + payloadLen
 
-		// Reslice to exact length
-		if cap(buf) >= totalLen {
-			buf = buf[:totalLen]
-		} else {
-			// Should not happen with GetBuffer, but safe fallback
-			buf = make([]byte, totalLen)
-		}
-
+	// Fast path for small messages: format on stack without any heap/pool allocations.
+	if payloadLen <= 512 {
+		var stackBuf [512 + LENGTHSIZE]byte
 		switch LENGTHSIZE {
 		case 2:
-			binary.BigEndian.PutUint16(buf[0:2], uint16(len(in)))
+			binary.BigEndian.PutUint16(stackBuf[0:2], uint16(payloadLen))
 		case 4:
-			binary.BigEndian.PutUint32(buf[0:4], uint32(len(in)))
+			binary.BigEndian.PutUint32(stackBuf[0:4], uint32(payloadLen))
+		default:
+			return fmt.Errorf("unsupported header size: %d", LENGTHSIZE)
 		}
-		copy(buf[LENGTHSIZE:], in)
-
-		_, err := w.Write(buf)
+		copy(stackBuf[LENGTHSIZE:], in)
+		_, err := w.Write(stackBuf[:totalLen])
 		return err
 	}
 
-	// Build header in a small stack buffer to avoid allocations.
-	var hdr [LENGTHSIZE]byte
+	// For larger messages, use the pooled buffer to avoid heap allocations.
+	buf := GetBuffer(totalLen)
 	switch LENGTHSIZE {
 	case 2:
-		binary.BigEndian.PutUint16(hdr[:], uint16(len(in)))
+		binary.BigEndian.PutUint16(buf[0:2], uint16(payloadLen))
 	case 4:
-		binary.BigEndian.PutUint32(hdr[:], uint32(len(in)))
+		binary.BigEndian.PutUint32(buf[0:4], uint32(payloadLen))
 	default:
+		PutBuffer(buf)
 		return fmt.Errorf("unsupported header size: %d", LENGTHSIZE)
 	}
-
-	// Attempt a vectorized write using net.Buffers to avoid copying payload.
-	// Falls back internally to sequential writes if writev is unavailable.
-	bufs := net.Buffers{hdr[:], in}
-	n, err := bufs.WriteTo(w)
-	if err != nil {
-		return err
-	}
-	expected := int64(len(hdr) + len(in))
-	if n != expected {
-		return io.ErrShortWrite
-	}
-
-	return nil
+	copy(buf[LENGTHSIZE:], in)
+	_, err := w.Write(buf)
+	PutBuffer(buf)
+	return err
 }
 
 // Read receives data from a connection using the message framing protocol.
@@ -193,10 +172,10 @@ func Read(r io.Reader) ([]byte, error) {
 		return nil, fmt.Errorf("unsupported header size: %d", LENGTHSIZE)
 	}
 
-	// Allocate the exact-sized payload buffer and read directly into it.
 	if length == 0 {
 		return []byte{}, nil
 	}
+
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, err
@@ -216,12 +195,12 @@ func ReadPooled(r io.Reader) ([]byte, error) {
 	}
 
 	// Parse the length value.
-	var length uint64
+	var length int
 	switch LENGTHSIZE {
 	case 2:
-		length = uint64(binary.BigEndian.Uint16(hdr[:]))
+		length = int(binary.BigEndian.Uint16(hdr[:]))
 	case 4:
-		length = uint64(binary.BigEndian.Uint32(hdr[:]))
+		length = int(binary.BigEndian.Uint32(hdr[:]))
 	default:
 		return nil, fmt.Errorf("unsupported header size: %d", LENGTHSIZE)
 	}
@@ -230,24 +209,11 @@ func ReadPooled(r io.Reader) ([]byte, error) {
 		return []byte{}, nil
 	}
 
-	// Get a buffer from the pool.
-	// Note: GetBuffer returns a slice with len=size if allocated new,
-	// or len=poolSize if from pool. We need to ensure we read exactly 'length'.
-	// But GetBuffer guarantees cap >= size.
-	buf := GetBuffer(int(length))
-
-	// Reslice to exact length needed for ReadFull
-	if cap(buf) < int(length) {
-		// Should not happen if GetBuffer works correctly
-		buf = make([]byte, length)
-	}
-	payload := buf[:length]
-
-	if _, err := io.ReadFull(r, payload); err != nil {
-		// Return buffer to pool on error if we managed to get one
+	buf := GetBuffer(length)
+	if _, err := io.ReadFull(r, buf); err != nil {
 		PutBuffer(buf)
 		return nil, err
 	}
 
-	return payload, nil
+	return buf, nil
 }

@@ -28,7 +28,7 @@ func TestPoolValidation_PoisonedConnection(t *testing.T) {
 			go func(c net.Conn) {
 				defer c.Close()
 				// Send unexpected data to the client
-				c.Write([]byte("garbage"))
+				_, _ = c.Write([]byte("garbage"))
 				// Keep connection open for a bit
 				time.Sleep(2 * time.Second)
 			}(conn)

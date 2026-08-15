@@ -12,9 +12,10 @@ type ServerConn struct {
 	writeMu sync.Mutex // serializes concurrent writes.
 }
 
-// init configures TCP keepalive settings on the connection.
+// init configures TCP keepalive and NoDelay settings on the connection.
 func (sc *ServerConn) init() {
 	if tcpConn, ok := sc.Conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
 		if sc.server.config.KeepAliveInterval > 0 {
 			if err := tcpConn.SetKeepAlive(true); err != nil {
 				sc.server.logf("set keepalive error: %v", err)

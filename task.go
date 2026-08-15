@@ -17,10 +17,9 @@ const (
 var nextTaskID uint32
 
 // globalTaskIDPool is the pool of pre-allocated task IDs.
-var globalTaskIDPool = newTaskIDPool(1024) // Initial target size (advisory only).
+var globalTaskIDPool = newTaskIDPool(1024)
 
-// taskIDPool manages reusable task ID byte arrays using a sync.Pool for
-// concurrency safety and reduced allocations.
+// taskIDPool manages reusable task ID byte arrays using a sync.Pool.
 type taskIDPool struct {
 	pool sync.Pool
 }
@@ -39,59 +38,53 @@ type Task struct {
 	optimized bool            // Tracks whether task uses pooled memory (for cleanup)
 	pooled    bool            // Tracks whether task struct and channels are pooled
 	refCount  int32           // Reference count for safe pooling (atomic)
-	cmdBuf    []byte          // Reusable buffer for command serialization
-	writeBufs [][]byte        // Reusable slice for net.Buffers (writev)
+	cmdBuf    []byte          // Reusable buffer for command serialization (preallocated)
+	writeBufs [][]byte        // Reusable slice for net.Buffers fallback
 }
 
-// newTaskIDPool creates a new task ID pool with the specified size.
+// newTaskIDPool creates a new task ID pool.
 func newTaskIDPool(_ uint64) *taskIDPool {
 	tp := &taskIDPool{}
 	tp.pool = sync.Pool{
 		New: func() any {
-			// Always produce a fresh 4-byte slice when the pool is empty.
-			return make([]byte, taskIDSize)
+			b := make([]byte, taskIDSize)
+			return &b
 		},
 	}
-
 	return tp
 }
 
 // getTaskID retrieves a task ID byte array from the pool.
 func (tp *taskIDPool) getTaskID() []byte {
 	if v := tp.pool.Get(); v != nil {
-		if b, ok := v.([]byte); ok {
-			return b
+		if ptr, ok := v.(*[]byte); ok && ptr != nil {
+			return *ptr
 		}
 	}
-	// Fallback if assertion fails
 	return make([]byte, taskIDSize)
 }
 
 // putTaskID returns a task ID byte array to the pool.
 func (tp *taskIDPool) putTaskID(taskID []byte) {
-	if len(taskID) != taskIDSize {
-		return // Don't pool incorrectly sized arrays.
+	if len(taskID) != taskIDSize || cap(taskID) < taskIDSize {
+		return
 	}
-	// Optionally zero the slice to avoid retaining IDs in memory; not required for correctness.
 	taskID[0], taskID[1], taskID[2], taskID[3] = 0, 0, 0, 0
-	tp.pool.Put(taskID)
+	tp.pool.Put(&taskID)
 }
 
-// Context returns the task's context, which can be used for cancellation
-// and timeout control. The context is typically created with a timeout
-// when using SendContext.
+// Context returns the task's context.
 func (t *Task) Context() context.Context {
 	return t.ctx
 }
 
 // addRef increments the reference count atomically.
-// This should be called when a goroutine begins using the task.
 func (t *Task) addRef() {
 	atomic.AddInt32(&t.refCount, 1)
 }
 
 // release decrements the reference count atomically.
-// Returns true if this was the last reference and task can be safely pooled.
+// Returns true if this was the last reference.
 func (t *Task) release() bool {
 	return atomic.AddInt32(&t.refCount, -1) == 0
 }

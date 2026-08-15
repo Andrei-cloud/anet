@@ -13,11 +13,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const (
-	// pendingShards is the number of shards for the pending task table.
-	pendingShards = 64
-)
-
 var (
 	// ErrQuit indicates the broker is shutting down normally.
 	ErrQuit = errors.New("broker is quitting")
@@ -41,7 +36,7 @@ type BrokerConfig struct {
 	// QueueSize is the size of the request queue. Default is 1000.
 	QueueSize int
 	// OptimizeMemory enables memory optimization features like task ID pooling.
-	// When enabled, reduces allocations and improves performance. Default is false.
+	// When enabled, reduces allocations and improves performance. Default is true.
 	OptimizeMemory bool
 }
 
@@ -55,18 +50,18 @@ type Broker interface {
 
 // Logger handles structured logging for the broker.
 type Logger interface {
-	Print(v ...any)                 // Info level.
-	Printf(format string, v ...any) // Info level formatted.
-	Infof(format string, v ...any)  // Info level with formatting.
-	Warnf(format string, v ...any)  // Warning level.
-	Errorf(format string, v ...any) // Error level.
+	Print(v ...any)
+	Printf(format string, v ...any)
+	Infof(format string, v ...any)
+	Warnf(format string, v ...any)
+	Errorf(format string, v ...any)
 }
 
 // broker implements the Broker interface.
 type broker struct {
 	workers      int
 	compool      []Pool
-	requestQueue chan *Task // Use blocking channel instead of RingBuffer
+	requestQueue chan *Task
 	//nolint:containedctx // Necessary for task cancellation within broker queue.
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -87,7 +82,7 @@ func DefaultBrokerConfig() *BrokerConfig {
 		WriteTimeout:   5 * time.Second,
 		ReadTimeout:    5 * time.Second,
 		QueueSize:      1000,
-		OptimizeMemory: true, // Memory optimization enabled by default.
+		OptimizeMemory: true,
 	}
 }
 
@@ -110,19 +105,20 @@ func NewBroker(p []Pool, n int, l Logger, config *BrokerConfig) Broker {
 	b := &broker{
 		workers:      n,
 		compool:      p,
-		requestQueue: make(chan *Task, config.QueueSize), // Buffered channel for efficient queuing
+		requestQueue: make(chan *Task, config.QueueSize),
 		ctx:          ctx,
 		cancel:       cancel,
 		logger:       l,
 		config:       config,
 	}
 
-	// Initialize object pools for memory optimization
 	b.taskPool = sync.Pool{
 		New: func() any {
 			return &Task{
-				response: make(chan []byte, 1),
-				errCh:    make(chan error, 1),
+				response:  make(chan []byte, 1),
+				errCh:     make(chan error, 1),
+				cmdBuf:    make([]byte, 512),
+				writeBufs: make([][]byte, 2),
 			}
 		},
 	}
@@ -132,104 +128,78 @@ func NewBroker(p []Pool, n int, l Logger, config *BrokerConfig) Broker {
 
 // Send sends a request and waits for the response.
 func (b *broker) Send(req *[]byte) ([]byte, error) {
-	allUsed := true
-	for _, p := range b.compool {
-		if p.Len() < p.Cap() {
-			allUsed = false
-
-			break
-		}
-	}
-	if allUsed {
-		return nil, ErrClosingBroker
-	}
-	// Use context.TODO for Send to avoid allocation overhead
-	// Use context.TODO for Send to avoid allocation overhead - safe since Send doesn't use context
-	task := b.newTask(context.TODO(), req)
 	if b.closing.Load() {
 		return nil, ErrClosingBroker
 	}
-	// Use non-blocking channel send - fail if queue is full or broker closing
+
+	task := b.newTask(context.Background(), req)
+
 	select {
 	case b.requestQueue <- task:
-		// Successfully queued
 	default:
-		// Queue full or broker closing
 		if b.closing.Load() || b.ctx.Err() != nil {
+			b.returnTaskToPool(task)
 			return nil, ErrClosingBroker
 		}
-
+		b.returnTaskToPool(task)
 		return nil, ErrQueueFull
 	}
+
 	select {
 	case resp := <-task.response:
-		// Success path: cleanup here to avoid racing with responder goroutines.
-		if task.optimized {
-			globalTaskIDPool.putTaskID(task.taskID)
-		}
-		// Return pooled objects after consumer has received the response.
 		b.returnTaskToPool(task)
-
 		return resp, nil
 	case err := <-task.errCh:
-		// Error path: perform cleanup symmetrically.
-		if task.optimized {
-			globalTaskIDPool.putTaskID(task.taskID)
-		}
 		b.returnTaskToPool(task)
-
 		return nil, err
+	case <-b.ctx.Done():
+		b.returnTaskToPool(task)
+		return nil, ErrClosingBroker
 	}
 }
 
 // SendContext sends a request with context support.
 func (b *broker) SendContext(ctx context.Context, req *[]byte) ([]byte, error) {
-	task := b.newTask(ctx, req)
 	if b.closing.Load() {
 		return nil, ErrClosingBroker
 	}
-	// Use non-blocking channel send with context checking
+	if ctx == nil {
+		return b.Send(req)
+	}
+
+	task := b.newTask(ctx, req)
+
 	select {
 	case b.requestQueue <- task:
-		// Successfully queued
 	case <-ctx.Done():
+		b.returnTaskToPool(task)
 		return nil, ctx.Err()
 	default:
-		// Queue full or broker closing
 		if b.closing.Load() || b.ctx.Err() != nil {
+			b.returnTaskToPool(task)
 			return nil, ErrClosingBroker
 		}
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		if err := ctx.Err(); err != nil {
+			b.returnTaskToPool(task)
+			return nil, err
 		}
-
+		b.returnTaskToPool(task)
 		return nil, ErrQueueFull
 	}
+
 	select {
 	case resp := <-task.response:
-		// Success path: cleanup here to avoid racing with responder goroutines.
-		if task.optimized {
-			globalTaskIDPool.putTaskID(task.taskID)
-		}
 		b.returnTaskToPool(task)
-
 		return resp, nil
 	case err := <-task.errCh:
-		// Error path: perform cleanup symmetrically.
-		if task.optimized {
-			globalTaskIDPool.putTaskID(task.taskID)
-		}
 		b.returnTaskToPool(task)
-
 		return nil, err
 	case <-ctx.Done():
-		// Context canceled: signal handled by worker or here; ensure cleanup.
-		if task.optimized {
-			globalTaskIDPool.putTaskID(task.taskID)
-		}
 		b.returnTaskToPool(task)
-
 		return nil, ctx.Err()
+	case <-b.ctx.Done():
+		b.returnTaskToPool(task)
+		return nil, ErrClosingBroker
 	}
 }
 
@@ -243,15 +213,11 @@ func (b *broker) Start() error {
 		b.wg.Add(1)
 		eg.Go(func() error {
 			defer b.wg.Done()
-
-			err := b.loop(workerID)
-
-			return err
+			return b.loop(workerID)
 		})
 	}
 
 	err := eg.Wait()
-
 	if err != nil && !errors.Is(err, ErrQuit) {
 		b.logger.Errorf("Broker stopped with error: %v", err)
 	} else {
@@ -263,49 +229,41 @@ func (b *broker) Start() error {
 
 func (b *broker) loop(_ int) error {
 	for {
-		// Blocking receive from queue - this eliminates spinning!
-		// Workers will efficiently block until work is available
 		select {
 		case task := <-b.requestQueue:
 			if task == nil {
-				b.logger.Errorf("broker: received nil task (possible bug)")
-
 				continue
 			}
-
 			b.processTask(task)
-
 		case <-b.ctx.Done():
 			return ErrQuit
 		}
 	}
 }
 
-// processTask handles a single task with proper reference counting for safe pooling.
 func (b *broker) processTask(task *Task) {
-	// Add reference for worker goroutine access
 	task.addRef()
-	defer b.returnTaskToPool(task) // Will safely handle reference counting
+	defer b.returnTaskToPool(task)
 
-	// Check closing status without context - faster atomic check
 	if b.closing.Load() {
 		b.trySendError(task, ErrClosingBroker)
 		return
 	}
 
-	// Get task context once and cache it
 	taskCtx := task.Context()
+	if taskCtx != nil {
+		if err := taskCtx.Err(); err != nil {
+			b.trySendError(task, err)
+			return
+		}
+	}
 
-	// Use lock-free pool selection
 	p := b.pickConnPool()
-
 	if p == nil {
 		b.trySendError(task, ErrNoPoolsAvailable)
-		// b.failPending(task) // No longer needed
 		return
 	}
 
-	// Context-aware connection retrieval
 	var wr PoolItem
 	var err error
 	if taskCtx != nil {
@@ -315,22 +273,17 @@ func (b *broker) processTask(task *Task) {
 	}
 
 	if err != nil {
-		// Only check context error after operation failure
 		if taskCtx != nil && errors.Is(err, taskCtx.Err()) {
 			b.trySendError(task, taskCtx.Err())
-			// b.failPending(task) // No longer needed
 			return
 		}
 		b.trySendError(task, fmt.Errorf("failed to get connection: %w", err))
-		// b.failPending(task) // No longer needed
-
 		return
 	}
 
 	err = b.handleConnection(task, wr)
 	if err != nil {
 		p.Release(wr)
-		// b.failPending(task) // No longer needed
 		return
 	}
 
@@ -342,61 +295,67 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 	if !ok {
 		err := errors.New("internal error: pool item is not net.Conn")
 		b.trySendError(task, err)
-		// b.failPending(task) // No longer needed
-
 		return err
 	}
 
-	// Capture task ID to avoid race condition with task reuse
-	// taskID := task.id
-
-	// activeConns was write-only and unused for logic, removed for performance.
-	// b.activeConns.Store(taskID, netConn)
-	// defer func() { b.activeConns.Delete(taskID) }()
-
-	// Prepare header in task.cmdBuf to avoid allocation
-	header := task.cmdBuf
-	payloadLen := taskIDSize + len(*task.request)
-
-	switch LENGTHSIZE {
-	case 2:
-		binary.BigEndian.PutUint16(header[0:2], uint16(payloadLen))
-	case 4:
-		binary.BigEndian.PutUint32(header[0:4], uint32(payloadLen))
+	reqPayloadLen := 0
+	if task.request != nil {
+		reqPayloadLen = len(*task.request)
 	}
-	copy(header[LENGTHSIZE:], task.taskID)
+	payloadLen := taskIDSize + reqPayloadLen
+	totalFrameLen := LENGTHSIZE + payloadLen
 
-	if b.closing.Load() {
-		b.trySendError(task, ErrClosingBroker)
-		// b.failPending(task) // No longer needed
+	// Optimization: If total frame fits in task.cmdBuf, do a single contiguous write.
+	if totalFrameLen <= cap(task.cmdBuf) {
+		task.cmdBuf = task.cmdBuf[:totalFrameLen]
+		switch LENGTHSIZE {
+		case 2:
+			binary.BigEndian.PutUint16(task.cmdBuf[0:2], uint16(payloadLen))
+		case 4:
+			binary.BigEndian.PutUint32(task.cmdBuf[0:4], uint32(payloadLen))
+		}
+		copy(task.cmdBuf[LENGTHSIZE:], task.taskID)
+		if reqPayloadLen > 0 {
+			copy(task.cmdBuf[LENGTHSIZE+taskIDSize:], *task.request)
+		}
 
-		return ErrClosingBroker
-	}
+		if b.config.WriteTimeout > 0 {
+			_ = netConn.SetWriteDeadline(time.Now().Add(b.config.WriteTimeout))
+		}
 
-	// Optimization: Only set write deadline if configured
-	if b.config.WriteTimeout > 0 {
-		writeDeadline := time.Now().Add(b.config.WriteTimeout)
-		if err := netConn.SetWriteDeadline(writeDeadline); err != nil {
-			b.trySendError(task, fmt.Errorf("setting write deadline: %w", err))
-			// b.failPending(task) // No longer needed
+		if _, err := netConn.Write(task.cmdBuf); err != nil {
+			b.trySendError(task, fmt.Errorf("writing to connection: %w", err))
+			return err
+		}
+	} else {
+		// Larger frame: format header in small buffer and use net.Buffers
+		header := task.cmdBuf[:LENGTHSIZE+taskIDSize]
+		switch LENGTHSIZE {
+		case 2:
+			binary.BigEndian.PutUint16(header[0:2], uint16(payloadLen))
+		case 4:
+			binary.BigEndian.PutUint32(header[0:4], uint32(payloadLen))
+		}
+		copy(header[LENGTHSIZE:], task.taskID)
 
+		if b.config.WriteTimeout > 0 {
+			_ = netConn.SetWriteDeadline(time.Now().Add(b.config.WriteTimeout))
+		}
+
+		task.writeBufs[0] = header
+		if task.request != nil {
+			task.writeBufs[1] = *task.request
+		} else {
+			task.writeBufs[1] = nil
+		}
+		bufs := net.Buffers(task.writeBufs)
+		if _, err := bufs.WriteTo(netConn); err != nil {
+			b.trySendError(task, fmt.Errorf("writing to connection: %w", err))
 			return err
 		}
 	}
 
-	// Use net.Buffers for zero-copy write
-	task.writeBufs[0] = header
-	task.writeBufs[1] = *task.request
-	bufs := net.Buffers(task.writeBufs)
-
-	if _, err := bufs.WriteTo(netConn); err != nil {
-		b.trySendError(task, fmt.Errorf("writing to connection: %w", err))
-		// b.failPending(task) // No longer needed
-
-		return err
-	}
-
-	// Compute read deadline as the earlier of broker ReadTimeout and task context deadline (if any).
+	// Compute read deadline
 	var readDeadline time.Time
 	if b.config.ReadTimeout > 0 {
 		readDeadline = time.Now().Add(b.config.ReadTimeout)
@@ -408,27 +367,18 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 			}
 		}
 	}
-	// Optimization: Only set read deadline if it's not zero
 	if !readDeadline.IsZero() {
-		if err := netConn.SetReadDeadline(readDeadline); err != nil {
-			b.trySendError(task, fmt.Errorf("setting read deadline: %w", err))
-			// b.failPending(task) // No longer needed
-
-			return err
-		}
+		_ = netConn.SetReadDeadline(readDeadline)
 	}
 
-	// Synchronous read avoids goroutine leaks and ensures connection isn't reused concurrently.
+	// Synchronous read
 	resp, err := Read(netConn)
 	if err != nil {
 		wrappedErr := fmt.Errorf("reading from connection: %w", err)
 		b.trySendError(task, wrappedErr)
-		// b.failPending(task) // No longer needed
-
 		return wrappedErr
 	}
 
-	// Verify Task ID matches
 	if len(resp) < taskIDSize {
 		err := errors.New("response too short")
 		b.trySendError(task, err)
@@ -444,27 +394,24 @@ func (b *broker) handleConnection(task *Task, wr PoolItem) error {
 	// Deliver response directly
 	func() {
 		defer func() { _ = recover() }()
-		task.response <- resp[taskIDSize:]
+		select {
+		case task.response <- resp[taskIDSize:]:
+		default:
+		}
 	}()
-
-	// Optimization: Do NOT reset the deadline here.
-	// The next user of this connection will overwrite the deadline anyway.
-	// This saves one syscall per request.
-	// _ = netConn.SetDeadline(time.Time{})
 
 	return nil
 }
 
 func (b *broker) pickConnPool() Pool {
-	if len(b.compool) == 0 {
+	poolsLen := len(b.compool)
+	if poolsLen == 0 {
 		return nil
 	}
-	if len(b.compool) == 1 {
+	if poolsLen == 1 {
 		return b.compool[0]
 	}
-	// Atomic round-robin pool selection for better load distribution
-	idx := b.poolIdx.Add(1) % uint32(len(b.compool))
-
+	idx := b.poolIdx.Add(1) % uint32(poolsLen)
 	return b.compool[idx]
 }
 
@@ -476,45 +423,18 @@ func (b *broker) trySendError(task *Task, err error) {
 	}
 }
 
-// func (b *broker) respondPending(resp []byte) {
-// 	if len(resp) < taskIDSize {
-// 		return
-// 	}
-// 	taskID := binary.BigEndian.Uint32(resp[:taskIDSize])
-
-// 	if task, ok := b.pending.Load(taskID); ok {
-// 		// Deliver the response. Block until the receiver reads it.
-// 		// Do not delete pending or return task here; the waiting sender will
-// 		// perform cleanup after receiving to avoid races.
-// 		func() {
-// 			defer func() { _ = recover() }()
-// 			task.response <- resp[taskIDSize:]
-// 		}()
-// 	}
-// }
-
-// func (b *broker) failPending(task *Task) {
-// 	// Pure logical cleanup: only remove from pending.
-// 	// Do NOT close channels or return the task; the waiting sender will
-// 	// receive an error (via trySendError) and perform cleanup safely.
-// 	b.pending.Delete(task.id)
-// }
-
-// returnTaskToPool returns a Task and its channels back to the pools.
-// This is now safe due to reference counting - task is only pooled when refCount reaches 0.
 func (b *broker) returnTaskToPool(task *Task) {
 	if !task.pooled {
-		return // Task wasn't from pool originally
+		return
 	}
 
-	// Only return to pool if this is the last reference
 	if task.release() {
-		// Zero out fields to prevent memory leaks and return the Task struct
+		if task.optimized && len(task.taskID) == taskIDSize {
+			globalTaskIDPool.putTaskID(task.taskID)
+		}
 		task.ctx = nil
 		task.request = nil
-		// Keep channels for reuse
-		// task.response = nil
-		// task.errCh = nil
+		task.taskID = nil
 		task.optimized = false
 		task.pooled = false
 		task.refCount = 0
@@ -523,12 +443,11 @@ func (b *broker) returnTaskToPool(task *Task) {
 }
 
 func (b *broker) newTask(ctx context.Context, r *[]byte) *Task {
-	// assign unique integer ID and encode into 4-byte header
 	id := atomic.AddUint32(&nextTaskID, 1)
 
-	// Use optimized task ID allocation if available
 	var taskIDBytes []byte
-	if b.config != nil && b.config.OptimizeMemory {
+	optimizeMemory := b.config != nil && b.config.OptimizeMemory
+	if optimizeMemory {
 		taskIDBytes = globalTaskIDPool.getTaskID()
 	} else {
 		taskIDBytes = make([]byte, taskIDSize)
@@ -536,27 +455,24 @@ func (b *broker) newTask(ctx context.Context, r *[]byte) *Task {
 
 	binary.BigEndian.PutUint32(taskIDBytes, id)
 
-	// Get pooled Task struct to reduce allocations (now with safe reference counting)
 	task, ok := b.taskPool.Get().(*Task)
 	if !ok {
 		task = &Task{
 			response:  make(chan []byte, 1),
 			errCh:     make(chan error, 1),
-			cmdBuf:    make([]byte, LENGTHSIZE+taskIDSize),
+			cmdBuf:    make([]byte, 512),
 			writeBufs: make([][]byte, 2),
 		}
 	} else {
-		if cap(task.cmdBuf) < LENGTHSIZE+taskIDSize {
-			task.cmdBuf = make([]byte, LENGTHSIZE+taskIDSize)
+		if cap(task.cmdBuf) < 512 {
+			task.cmdBuf = make([]byte, 512)
 		}
 		if cap(task.writeBufs) < 2 {
 			task.writeBufs = make([][]byte, 2)
 		}
 	}
-	task.cmdBuf = task.cmdBuf[:LENGTHSIZE+taskIDSize]
-	task.writeBufs = task.writeBufs[:2]
 
-	// Drain channels to ensure they are empty before reuse
+	// Drain stale channel entries if any
 	select {
 	case <-task.response:
 	default:
@@ -566,27 +482,24 @@ func (b *broker) newTask(ctx context.Context, r *[]byte) *Task {
 	default:
 	}
 
-	// Initialize the task
 	task.ctx = ctx
 	task.id = id
 	task.taskID = taskIDBytes
-	// task.response and task.errCh are already set and drained
 	task.request = r
-	task.optimized = b.config != nil && b.config.OptimizeMemory
+	task.optimized = optimizeMemory
 	task.pooled = true
-	task.refCount = 1 // Initial reference for the caller
+	task.refCount = 1
 
 	return task
 }
 
 // Close shuts down the broker, canceling context and waiting for workers to exit.
 func (b *broker) Close() {
-	// Ensure idempotent shutdown
 	if !b.closing.CompareAndSwap(false, true) {
 		return
 	}
 
-	// Best-effort: fail any queued tasks immediately to unblock senders
+	// Fail any queued tasks immediately
 	for {
 		select {
 		case task := <-b.requestQueue:
@@ -599,15 +512,6 @@ func (b *broker) Close() {
 	}
 drained:
 
-	// Inform all pending tasks that we're closing
-	// b.pending.ForEachAndClear(func(_ uint32, task *Task) {
-	// 	if task != nil {
-	// 		b.trySendError(task, ErrClosingBroker)
-	// 		b.failPending(task)
-	// 	}
-	// })
-
-	// Cancel broker context to stop workers and wait for them to exit
 	b.cancel()
 	b.wg.Wait()
 }

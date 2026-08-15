@@ -2,150 +2,119 @@
 package anet
 
 import (
+	"math/bits"
 	"sync"
 )
 
 // maxBufferSize is the maximum size of buffers that will be pooled.
-// Larger buffers will be allocated but not pooled to prevent memory bloat.
+// Larger buffers will be allocated directly and not pooled to prevent memory bloat.
 const maxBufferSize = 64 * 1024 // 64KB
 
-// globalBufferPool is a NUMA-aware wrapper around per-node buffer pools.
-var globalBufferPool = newGlobalBufferPool()
+const (
+	minClassShift = 5                                 // 1 << 5 = 32 bytes
+	maxClassShift = 16                                // 1 << 16 = 65536 bytes (64KB)
+	numClasses    = maxClassShift - minClassShift + 1 // 12 size classes
+)
 
-// globalBufferPoolType manages buffer pools per NUMA node.
-type globalBufferPoolType struct {
-	pools []*bufferPool // one pool per NUMA node
-	nodes int           // number of NUMA nodes detected
+// globalBufferPool manages the buffer pools.
+var globalBufferPool = newBufferPool()
+
+// ptrPool reuses *[]byte pointers to avoid any heap allocation on Put.
+var ptrPool = sync.Pool{
+	New: func() any {
+		return new([]byte)
+	},
 }
 
-// bufferPool manages a set of sync.Pool instances for different buffer sizes.
-// This helps reduce memory allocations and GC pressure by reusing buffers.
+// bufferPool manages a set of sync.Pool instances for different power-of-two size classes (32B to 64KB).
 type bufferPool struct {
-	pools []*sync.Pool // Array of pools for different size classes
+	pools [numClasses]sync.Pool
 }
 
-// newGlobalBufferPool creates a NUMA-aware global buffer pool.
-func newGlobalBufferPool() *globalBufferPoolType {
-	nodes := detectNUMANodes()
-	pools := make([]*bufferPool, nodes)
-	for i := 0; i < nodes; i++ {
-		pools[i] = newBufferPool()
-	}
-
-	return &globalBufferPoolType{pools: pools, nodes: nodes}
-}
-
-// detectNUMANodes returns the number of NUMA nodes on this system. Defaults to 1.
-func detectNUMANodes() int {
-	return 1 // stub: real detection can be added via cgo or syscalls
-}
-
-// newBufferPool creates a new buffer pool with pre-allocated sync.Pool instances
-// for common buffer sizes. This improves performance by reducing allocations
-// for frequently used message sizes.
+// newBufferPool creates a new buffer pool with pre-allocated sync.Pool instances.
 func newBufferPool() *bufferPool {
-	bp := &bufferPool{
-		pools: make([]*sync.Pool, 32), // Pool sizes from 32B to 64KB.
-	}
-
-	for i := range bp.pools {
-		size := 32 << uint(i) // 32, 64, 128, ..., 64KB.
-		if size > maxBufferSize {
-			break
-		}
-		bp.pools[i] = &sync.Pool{
+	bp := &bufferPool{}
+	for i := 0; i < numClasses; i++ {
+		size := 1 << (i + minClassShift)
+		bp.pools[i] = sync.Pool{
 			New: func() any {
-				return make([]byte, size)
+				ptr := new([]byte)
+				*ptr = make([]byte, size)
+				return ptr
 			},
 		}
 	}
-
 	return bp
 }
 
 // GetBuffer retrieves a buffer from the pool that is at least size bytes.
-// If no suitable buffer exists in the pool, a new one will be allocated.
-// The returned buffer may be larger than requested but will be at least size bytes.
+// If size exceeds maxBufferSize, a fresh buffer is allocated directly.
+// The returned buffer slice has length equal to size, with capacity >= size.
 func GetBuffer(size int) []byte {
 	return globalBufferPool.getBuffer(size)
 }
 
-// PutBuffer returns a buffer to the pool for future reuse.
-// Buffers larger than maxBufferSize are not pooled to prevent memory bloat.
-// The buffer should not be accessed after being returned to the pool.
+// PutBuffer returns a buffer to the pool for future reuse with ZERO heap allocations.
 func PutBuffer(buf []byte) {
 	globalBufferPool.putBuffer(buf)
 }
 
-// getBuffer retrieves a buffer from the pool that is at least size bytes.
-// If no suitable buffer exists in the pool, a new one will be allocated.
-// The returned buffer may be larger than requested but will be at least size bytes.
+// getBuffer retrieves a buffer from the appropriate size class pool in O(1).
 func (bp *bufferPool) getBuffer(size int) []byte {
+	if size <= 0 {
+		return []byte{}
+	}
 	if size > maxBufferSize {
 		return make([]byte, size)
 	}
 
-	// Find the smallest pool that fits the size.
-	poolIdx := 0
-	poolSize := 32
-	for poolSize < size {
-		poolSize *= 2
-		poolIdx++
+	var classIdx int
+	if size > (1 << minClassShift) {
+		classIdx = bits.Len32(uint32(size-1)) - minClassShift
+	} else {
+		classIdx = 0
 	}
 
-	// retrieve buffer from pool and check type assertion.
-	obj := bp.pools[poolIdx].Get()
-	if buf, ok := obj.([]byte); ok {
-		// Ensure buffer length matches class and capacity is sufficient.
+	if classIdx < 0 {
+		classIdx = 0
+	} else if classIdx >= numClasses {
+		classIdx = numClasses - 1
+	}
+
+	poolSize := 1 << (classIdx + minClassShift)
+	obj := bp.pools[classIdx].Get()
+	if ptr, ok := obj.(*[]byte); ok && ptr != nil {
+		buf := *ptr
+		*ptr = nil
+		ptrPool.Put(ptr)
 		if cap(buf) >= poolSize {
-			if len(buf) != poolSize {
-				buf = buf[:poolSize]
-			}
-
-			return buf
+			return buf[:size]
 		}
-		// Incorrect capacity (shouldn't happen) — fall through to allocate.
 	}
-	// fallback allocation if buffer type is not as expected.
-	return make([]byte, poolSize)
+
+	buf := make([]byte, poolSize)
+	return buf[:size]
 }
 
-// putBuffer returns a buffer to the pool for future reuse.
-// Buffers larger than maxBufferSize are not pooled to prevent memory bloat.
-// The buffer should not be accessed after being returned to the pool.
+// putBuffer returns a buffer to its appropriate size class pool in O(1) with 0 allocs.
 func (bp *bufferPool) putBuffer(buf []byte) {
-	// Base pooling decision and bucket on capacity to avoid mis-bucketing
-	// when callers reslice to smaller lengths.
-	if cap(buf) > maxBufferSize {
-		return // Don't pool large-capacity buffers.
+	c := cap(buf)
+	if c > maxBufferSize || c < (1<<minClassShift) {
+		return
 	}
 
-	// Find the correct pool based on capacity
-	poolIdx := 0
-	poolSize := 32
-	target := cap(buf)
-	for poolSize < target {
-		poolSize *= 2
-		poolIdx++
+	classIdx := bits.Len32(uint32(c)) - 1 - minClassShift
+	if classIdx < 0 || classIdx >= numClasses {
+		return
 	}
 
-	// Normalize slice length to the class size before putting back.
-	if cap(buf) >= poolSize {
-		if len(buf) != poolSize {
-			buf = buf[:poolSize]
-		}
-		//nolint:staticcheck // SA6002: passing buf by value is necessary for the pool.
-		bp.pools[poolIdx].Put(buf)
+	poolSize := 1 << (classIdx + minClassShift)
+	if c < poolSize {
+		return
 	}
-}
 
-// getBuffer retrieves a buffer from the local NUMA node pool.
-func (g *globalBufferPoolType) getBuffer(size int) []byte {
-	// for now, always use node 0
-	return g.pools[0].getBuffer(size)
-}
-
-// putBuffer returns a buffer to the local NUMA node pool.
-func (g *globalBufferPoolType) putBuffer(buf []byte) {
-	g.pools[0].putBuffer(buf)
+	buf = buf[:poolSize]
+	ptr := ptrPool.Get().(*[]byte)
+	*ptr = buf
+	bp.pools[classIdx].Put(ptr)
 }
