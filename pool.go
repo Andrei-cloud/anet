@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -95,6 +96,7 @@ type pool struct {
 	logger      *os.File
 	config      *PoolConfig
 	stopChan    chan struct{}
+	mu          sync.RWMutex
 }
 
 // DefaultPoolConfig returns the default configuration.
@@ -176,37 +178,50 @@ func (p *pool) validateConnectionSubset() {
 	maxToCheck := 5
 checkLoop:
 	for range maxToCheck {
+		var item PoolItem
+		p.mu.RLock()
+		if p.closing.Load() {
+			p.mu.RUnlock()
+			return
+		}
 		select {
-		case item := <-p.queue:
-			if item == nil {
-				continue
-			}
-
-			if p.validateConnection(item) {
-				p.returnOrRelease(item)
-			} else {
-				p.Release(item)
-			}
+		case item = <-p.queue:
+			p.mu.RUnlock()
 		default:
+			p.mu.RUnlock()
 			break checkLoop
+		}
+
+		if item == nil {
+			continue
+		}
+
+		if p.validateConnection(item) {
+			p.returnOrRelease(item)
+		} else {
+			p.Release(item)
 		}
 	}
 }
 
 // returnOrRelease tries to return item to pool, releases if pool is full or closed.
 func (p *pool) returnOrRelease(item PoolItem) {
+	if item == nil {
+		return
+	}
+
+	p.mu.RLock()
 	if p.closing.Load() {
+		p.mu.RUnlock()
 		p.Release(item)
 		return
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			p.Release(item)
-		}
-	}()
+
 	select {
 	case p.queue <- item:
+		p.mu.RUnlock()
 	default:
+		p.mu.RUnlock()
 		p.Release(item)
 	}
 }
@@ -217,14 +232,21 @@ func (p *pool) Get() (PoolItem, error) {
 		return nil, ErrClosing
 	}
 
-	// Fast path: try to get an existing connection from the queue.
+	// Fast path: try to get an existing connection from the queue under read lock.
+	p.mu.RLock()
+	if p.closing.Load() {
+		p.mu.RUnlock()
+		return nil, ErrClosing
+	}
 	select {
 	case item := <-p.queue:
+		p.mu.RUnlock()
 		if item == nil {
 			return nil, ErrClosing
 		}
 		return item, nil
 	default:
+		p.mu.RUnlock()
 	}
 
 	// Try to create a new connection if under capacity.
@@ -239,17 +261,24 @@ func (p *pool) Get() (PoolItem, error) {
 				p.count.Add(^uint32(0))
 				return nil, err
 			}
+			if p.closing.Load() {
+				p.Release(item)
+				return nil, ErrClosing
+			}
 			return item, nil
 		}
 	}
 
-	// Wait for a connection to become available.
-	item := <-p.queue
-	if item == nil {
+	// Wait for a connection to become available or pool closing.
+	select {
+	case item := <-p.queue:
+		if item == nil {
+			return nil, ErrClosing
+		}
+		return item, nil
+	case <-p.stopChan:
 		return nil, ErrClosing
 	}
-
-	return item, nil
 }
 
 // GetWithContext retrieves an item with context cancellation support.
@@ -258,14 +287,21 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 		return nil, ErrClosing
 	}
 
-	// Fast path: try to get an existing connection immediately.
+	// Fast path: try to get an existing connection immediately under read lock.
+	p.mu.RLock()
+	if p.closing.Load() {
+		p.mu.RUnlock()
+		return nil, ErrClosing
+	}
 	select {
 	case item := <-p.queue:
+		p.mu.RUnlock()
 		if item == nil {
 			return nil, ErrClosing
 		}
 		return item, nil
 	default:
+		p.mu.RUnlock()
 	}
 
 	// Try to create a new connection if under capacity.
@@ -280,11 +316,15 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 				p.count.Add(^uint32(0))
 				return nil, err
 			}
+			if p.closing.Load() {
+				p.Release(item)
+				return nil, ErrClosing
+			}
 			return item, nil
 		}
 	}
 
-	// Wait for an available connection or context cancellation.
+	// Wait for an available connection, context cancellation, or pool shutdown.
 	select {
 	case item := <-p.queue:
 		if item == nil {
@@ -293,6 +333,8 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 		return item, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-p.stopChan:
+		return nil, ErrClosing
 	}
 }
 
@@ -302,20 +344,18 @@ func (p *pool) Put(item PoolItem) {
 		return
 	}
 
+	p.mu.RLock()
 	if p.closing.Load() {
+		p.mu.RUnlock()
 		p.Release(item)
 		return
 	}
 
-	defer func() {
-		if r := recover(); r != nil {
-			p.Release(item)
-		}
-	}()
-
 	select {
 	case p.queue <- item:
+		p.mu.RUnlock()
 	default:
+		p.mu.RUnlock()
 		p.Release(item)
 	}
 }
@@ -334,21 +374,28 @@ func (p *pool) Release(item PoolItem) {
 	}
 }
 
-// Close closes the pool and all its items.
+// Close closes the pool and all its items safely without channel races.
 func (p *pool) Close() {
 	if !p.closing.CompareAndSwap(false, true) {
 		return
 	}
 
 	close(p.stopChan)
-	close(p.queue)
 
-	itemsToClose := make([]PoolItem, 0, cap(p.queue))
-	for item := range p.queue {
-		if item != nil {
-			itemsToClose = append(itemsToClose, item)
+	p.mu.Lock()
+	var itemsToClose []PoolItem
+drainLoop:
+	for {
+		select {
+		case item := <-p.queue:
+			if item != nil {
+				itemsToClose = append(itemsToClose, item)
+			}
+		default:
+			break drainLoop
 		}
 	}
+	p.mu.Unlock()
 
 	for _, item := range itemsToClose {
 		p.Release(item)

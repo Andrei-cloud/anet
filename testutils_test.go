@@ -9,25 +9,11 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/andrei-cloud/anet"
 )
-
-// waitGroupWithTimeout waits for the wait group or times out.
-func waitGroupWithTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
-	c := make(chan struct{})
-	go func() {
-		defer close(c)
-		wg.Wait()
-	}()
-	select {
-	case <-c:
-		return true
-	case <-time.After(timeout):
-		return false
-	}
-}
 
 // StartTestServer creates a TCP server for testing that echoes back any received messages.
 // It implements the anet message framing protocol with proper error handling and graceful shutdown.
@@ -66,17 +52,18 @@ func StartTestServer() (string, func() error, error) {
 	listenerCond := sync.NewCond(&listenerMu)
 
 	connSem := make(chan struct{}, maxConns)
-	var activeConnections sync.WaitGroup
+	var activeConnCount atomic.Int32
 	var liveConns sync.Map
 
 	handleConn := func(conn net.Conn) {
+		activeConnCount.Add(1)
 		liveConns.Store(conn, conn)
 		var shouldBroadcast bool
 		defer func() {
 			liveConns.Delete(conn)
 			_ = conn.Close()
 			<-connSem
-			activeConnections.Done()
+			activeConnCount.Add(-1)
 			if len(connSem) == maxConns-1 {
 				shouldBroadcast = true
 			}
@@ -178,7 +165,6 @@ func StartTestServer() (string, func() error, error) {
 				return
 			}
 
-			activeConnections.Add(1)
 			go handleConn(conn)
 		}
 	}()
@@ -199,8 +185,9 @@ func StartTestServer() (string, func() error, error) {
 			return true
 		})
 
-		if !waitGroupWithTimeout(&activeConnections, shutdownTimeout) {
-			log.Printf("Timed out waiting for test server connections to close")
+		deadline := time.Now().Add(shutdownTimeout)
+		for activeConnCount.Load() > 0 && time.Now().Before(deadline) {
+			time.Sleep(2 * time.Millisecond)
 		}
 
 		return err

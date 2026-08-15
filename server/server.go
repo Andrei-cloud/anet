@@ -20,6 +20,7 @@ type Server struct {
 	activeConnCount atomic.Int32   // atomic counter for active connections
 	connWG          sync.WaitGroup // tracks active connection goroutines.
 	stopChan        chan struct{}  // signals server shutdown.
+	stopping        atomic.Bool    // atomic flag for idempotent shutdown.
 	handlerSem      chan struct{}  // semaphore to limit concurrent handlers.
 }
 
@@ -59,6 +60,9 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) Stop() error {
+	if !s.stopping.CompareAndSwap(false, true) {
+		return nil
+	}
 	close(s.stopChan)
 
 	var err error
