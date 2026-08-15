@@ -240,7 +240,6 @@ func TestBroker(t *testing.T) {
 			ReadTimeout:  100 * time.Millisecond,
 		}
 
-		// Create a pool with small capacity
 		p := anet.NewPool(1, factory, addr, nil)
 		require.NotNil(t, p)
 		defer p.Close()
@@ -249,19 +248,16 @@ func TestBroker(t *testing.T) {
 		require.NotNil(t, broker)
 		defer broker.Close()
 
-		// Block the only available connection
-		item, err := p.Get()
-		if err != nil {
-			t.Skip("Skipping test due to connection error")
-			return
-		}
-		defer p.Put(item)
+		// Fill queue capacity (1 slot) without running workers
+		msg1 := []byte("msg1")
+		go func() { _, _ = broker.Send(&msg1) }()
+		time.Sleep(20 * time.Millisecond)
 
-		// Try to send when no connections are available
-		msg := []byte("overflow")
-		_, err = broker.Send(&msg)
+		// Next send should immediately return ErrQueueFull
+		msg2 := []byte("overflow")
+		_, err = broker.Send(&msg2)
 		require.Error(t, err)
-		require.Equal(t, anet.ErrClosingBroker, err)
+		require.Equal(t, anet.ErrQueueFull, err)
 	})
 
 	t.Run("SendContext with Multiple Pools", func(t *testing.T) {

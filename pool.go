@@ -44,6 +44,27 @@ type PoolConfig struct {
 	MaxValidationAttempts int
 }
 
+func (c *PoolConfig) applyDefaults() {
+	if c.DialTimeout == 0 {
+		c.DialTimeout = 5 * time.Second
+	}
+	if c.IdleTimeout == 0 {
+		c.IdleTimeout = 60 * time.Second
+	}
+	if c.KeepAliveInterval == 0 {
+		c.KeepAliveInterval = 30 * time.Second
+	}
+	if c.ValidationStrategy == "" {
+		c.ValidationStrategy = ValidationRead
+	}
+	if c.ValidationTimeout == 0 {
+		c.ValidationTimeout = 1 * time.Second
+	}
+	if c.MaxValidationAttempts == 0 {
+		c.MaxValidationAttempts = 3
+	}
+}
+
 // Pool manages a collection of reusable connections.
 type Pool interface {
 	Get() (PoolItem, error)
@@ -78,7 +99,7 @@ type pool struct {
 
 // DefaultPoolConfig returns the default configuration.
 func DefaultPoolConfig() *PoolConfig {
-	return &PoolConfig{
+	cfg := &PoolConfig{
 		DialTimeout:           5 * time.Second,
 		IdleTimeout:           60 * time.Second,
 		ValidationInterval:    30 * time.Second,
@@ -87,13 +108,11 @@ func DefaultPoolConfig() *PoolConfig {
 		ValidationTimeout:     1 * time.Second,
 		MaxValidationAttempts: 3,
 	}
+	return cfg
 }
 
 // NewPoolList creates a list of Pool interfaces from a slice of addresses.
 func NewPoolList(poolCap uint32, f Factory, addrs []string, config *PoolConfig) []Pool {
-	if config == nil {
-		config = DefaultPoolConfig()
-	}
 	pools := make([]Pool, 0, len(addrs))
 	for _, addr := range addrs {
 		p := NewPool(poolCap, f, addr, config)
@@ -105,29 +124,32 @@ func NewPoolList(poolCap uint32, f Factory, addrs []string, config *PoolConfig) 
 
 // NewPool creates a new connection pool.
 func NewPool(poolCap uint32, f Factory, addr string, config *PoolConfig) Pool {
-	if config == nil {
-		config = DefaultPoolConfig()
+	cfg := &PoolConfig{}
+	if config != nil {
+		*cfg = *config
 	}
+	cfg.applyDefaults()
+
 	p := &pool{
 		addr:        addr,
 		capacity:    poolCap,
 		queue:       make(chan PoolItem, poolCap),
 		factoryFunc: f,
 		logger:      os.Stderr,
-		config:      config,
+		config:      cfg,
 		stopChan:    make(chan struct{}),
 	}
 	p.closing.Store(false)
 
 	// Start background validation if interval is set.
-	if p.config.ValidationInterval > 0 {
+	if p.config.ValidationInterval > 0 && p.config.ValidationStrategy != ValidationNone {
 		go p.validateIdleConnections()
 	}
 
 	return p
 }
 
-// validateIdleConnections periodically validates idle connections - simplified.
+// validateIdleConnections periodically validates idle connections.
 func (p *pool) validateIdleConnections() {
 	ticker := time.NewTicker(p.config.ValidationInterval)
 	defer ticker.Stop()
@@ -144,18 +166,14 @@ func (p *pool) validateIdleConnections() {
 
 // validateConnectionSubset validates a small subset of idle connections.
 func (p *pool) validateConnectionSubset() {
-	// Check closing status without lock first
 	if p.closing.Load() {
 		return
 	}
-
-	// Skip validation if strategy is none
 	if p.config.ValidationStrategy == ValidationNone {
 		return
 	}
 
-	// Only validate a small subset to avoid performance impact
-	maxToCheck := 5 // Limit validation to avoid overhead
+	maxToCheck := 5
 checkLoop:
 	for range maxToCheck {
 		select {
@@ -164,12 +182,9 @@ checkLoop:
 				continue
 			}
 
-			// Validate the connection
 			if p.validateConnection(item) {
-				// Connection is healthy, return to pool
 				p.returnOrRelease(item)
 			} else {
-				// Connection is unhealthy, release it
 				p.Release(item)
 			}
 		default:
@@ -178,11 +193,19 @@ checkLoop:
 	}
 }
 
-// returnOrRelease tries to return item to pool, releases if pool is full.
+// returnOrRelease tries to return item to pool, releases if pool is full or closed.
 func (p *pool) returnOrRelease(item PoolItem) {
+	if p.closing.Load() {
+		p.Release(item)
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			p.Release(item)
+		}
+	}()
 	select {
 	case p.queue <- item:
-		// Successfully returned to pool
 	default:
 		p.Release(item)
 	}
@@ -200,8 +223,6 @@ func (p *pool) Get() (PoolItem, error) {
 		if item == nil {
 			return nil, ErrClosing
 		}
-		// Skip validation in fast path - let actual usage detect issues
-
 		return item, nil
 	default:
 	}
@@ -218,10 +239,8 @@ func (p *pool) Get() (PoolItem, error) {
 				p.count.Add(^uint32(0))
 				return nil, err
 			}
-
 			return item, nil
 		}
-		// CAS failed, retry loop
 	}
 
 	// Wait for a connection to become available.
@@ -233,24 +252,23 @@ func (p *pool) Get() (PoolItem, error) {
 	return item, nil
 }
 
-// GetWithContext retrieves an item with minimal context checking.
+// GetWithContext retrieves an item with context cancellation support.
 func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 	if p.closing.Load() {
 		return nil, ErrClosing
 	}
 
-	// Ultra-fast path: try to get without any validation or context check
+	// Fast path: try to get an existing connection immediately.
 	select {
 	case item := <-p.queue:
 		if item == nil {
 			return nil, ErrClosing
 		}
-
 		return item, nil
 	default:
 	}
 
-	// Try to create a new connection if under capacity
+	// Try to create a new connection if under capacity.
 	for {
 		current := p.count.Load()
 		if current >= p.capacity {
@@ -262,26 +280,23 @@ func (p *pool) GetWithContext(ctx context.Context) (PoolItem, error) {
 				p.count.Add(^uint32(0))
 				return nil, err
 			}
-
 			return item, nil
 		}
-		// CAS failed, retry loop
 	}
 
-	// Wait for an available connection or context cancellation
+	// Wait for an available connection or context cancellation.
 	select {
 	case item := <-p.queue:
 		if item == nil {
 			return nil, ErrClosing
 		}
-
 		return item, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
-// Put returns an item to the pool with minimal validation.
+// Put returns an item to the pool.
 func (p *pool) Put(item PoolItem) {
 	if item == nil {
 		return
@@ -292,7 +307,12 @@ func (p *pool) Put(item PoolItem) {
 		return
 	}
 
-	// Skip validation in Put - just add back to pool
+	defer func() {
+		if r := recover(); r != nil {
+			p.Release(item)
+		}
+	}()
+
 	select {
 	case p.queue <- item:
 	default:
@@ -314,20 +334,15 @@ func (p *pool) Release(item PoolItem) {
 	}
 }
 
-// Close closes the pool and all its items with minimal locking.
+// Close closes the pool and all its items.
 func (p *pool) Close() {
-	// Fast check to avoid lock if already closing.
 	if !p.closing.CompareAndSwap(false, true) {
-		return // Already closing or closed
+		return
 	}
 
-	// Signal stop to background goroutine
 	close(p.stopChan)
-
-	// Close the queue to signal no more items
 	close(p.queue)
 
-	// Collect and close items without holding locks
 	itemsToClose := make([]PoolItem, 0, cap(p.queue))
 	for item := range p.queue {
 		if item != nil {
@@ -335,13 +350,12 @@ func (p *pool) Close() {
 		}
 	}
 
-	// Release items outside any locks
 	for _, item := range itemsToClose {
 		p.Release(item)
 	}
 }
 
-// Len returns the current number of items in the pool.
+// Len returns the current number of items created in the pool.
 func (p *pool) Len() int {
 	return int(p.count.Load())
 }
@@ -357,43 +371,27 @@ func (p *pool) validateConnection(item PoolItem) bool {
 		return false
 	}
 
-	// Extract connection from PoolItem
 	conn, ok := item.(interface{ SetDeadline(time.Time) error })
 	if !ok {
-		// Item doesn't support deadlines, use basic validation
 		return p.validateConnectionBasic(item)
 	}
 
-	// Set deadline for validation
 	deadline := time.Now().Add(p.config.ValidationTimeout)
 	if err := conn.SetDeadline(deadline); err != nil {
 		return false
 	}
 
-	// Restore deadline after validation
 	defer func() {
-		// Reset deadline to no timeout
 		_ = conn.SetDeadline(time.Time{})
 	}()
 
 	return p.validateConnectionWithStrategy(item)
 }
 
-// validateConnectionBasic performs basic validation without timeout support.
 func (p *pool) validateConnectionBasic(_ PoolItem) bool {
-	switch p.config.ValidationStrategy {
-	case ValidationNone:
-		return true
-	case ValidationPing, ValidationRead:
-		// For items without deadline support, we can't safely validate
-		// Return true to avoid unnecessary connection churn
-		return true
-	default:
-		return true
-	}
+	return true
 }
 
-// validateConnectionWithStrategy performs validation based on the configured strategy.
 func (p *pool) validateConnectionWithStrategy(item PoolItem) bool {
 	var lastErr error
 
@@ -403,13 +401,10 @@ func (p *pool) validateConnectionWithStrategy(item PoolItem) bool {
 		switch p.config.ValidationStrategy {
 		case ValidationNone:
 			return true
-
 		case ValidationPing:
 			err = p.validatePing(item)
-
 		case ValidationRead:
 			err = p.validateRead(item)
-
 		default:
 			return true
 		}
@@ -419,15 +414,12 @@ func (p *pool) validateConnectionWithStrategy(item PoolItem) bool {
 		}
 
 		lastErr = err
-
-		// Brief pause between attempts
 		if attempt < p.config.MaxValidationAttempts-1 {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
 
-	// Log validation failure if we have a logger
-	if p.logger != nil {
+	if p.logger != nil && lastErr != nil {
 		_, _ = fmt.Fprintf(p.logger, "Connection validation failed after %d attempts: %v\n",
 			p.config.MaxValidationAttempts, lastErr)
 	}
@@ -435,74 +427,51 @@ func (p *pool) validateConnectionWithStrategy(item PoolItem) bool {
 	return false
 }
 
-// validatePing attempts to check if the connection is alive using TCP-level checks.
 func (p *pool) validatePing(item PoolItem) error {
-	// Try to cast to net.Conn for TCP-specific checks
 	if conn, ok := item.(net.Conn); ok {
-		// For TCP connections, we can try to read with a very small buffer
-		// This will detect closed connections without consuming data
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			// Use a 1-byte buffer to check connection state
 			var b [1]byte
 			_ = tcpConn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
 			n, err := tcpConn.Read(b[:])
-			_ = tcpConn.SetReadDeadline(time.Time{}) // Reset deadline
+			_ = tcpConn.SetReadDeadline(time.Time{})
 
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					// Timeout is expected for healthy connections with no data
 					return nil
 				}
-				// Other errors indicate connection problems
 				return err
 			}
 
 			if n > 0 {
-				// Unexpected data - this might indicate a protocol issue
-				// The connection is alive, but has unexpected data.
-				// We should consider it invalid to avoid protocol desync.
 				return fmt.Errorf("unexpected data during ping validation")
 			}
 		}
 	}
-
-	// For non-TCP connections or if TCP checks fail, just return success
-	// to avoid false positives
 	return nil
 }
 
-// validateRead attempts to perform a minimal read to check connection health.
 func (p *pool) validateRead(item PoolItem) error {
-	// Cast to io.Reader if possible
 	reader, ok := item.(io.Reader)
 	if !ok {
-		// Item doesn't support reading, consider it valid
 		return nil
 	}
 
-	// Try to read with a very short deadline
 	if conn, ok := item.(net.Conn); ok {
 		oldDeadline := time.Now().Add(p.config.ValidationTimeout)
 		_ = conn.SetReadDeadline(oldDeadline)
-		defer func() { _ = conn.SetReadDeadline(time.Time{}) }() // Reset deadline
+		defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 	}
 
-	// Attempt to read a single byte
 	var b [1]byte
 	n, err := reader.Read(b[:])
 	if err != nil {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			// Timeout is expected for healthy connections with no pending data
 			return nil
 		}
-		// Other errors (EOF, connection reset, etc.) indicate problems
 		return err
 	}
 
 	if n > 0 {
-		// We read data, which means the connection is alive
-		// However, for a request-response protocol, idle connections shouldn't have data.
-		// We consider this a validation failure to prevent protocol desync.
 		return fmt.Errorf("unexpected data during read validation")
 	}
 

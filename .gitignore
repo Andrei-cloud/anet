@@ -3,3 +3,5 @@ profile.out
 anet.test
 .github/copilot-instructions.md
 .DS_Store
+cpu_pipe.prof
+cpu.prof

@@ -61,25 +61,23 @@ func (s *Server) Start() error {
 func (s *Server) Stop() error {
 	close(s.stopChan)
 
-	err := s.listener.Close()
-	if err != nil {
-		return err
+	var err error
+	if s.listener != nil {
+		err = s.listener.Close()
 	}
 
 	s.activeConns.Range(func(_, val any) bool {
 		if c, ok := val.(*ServerConn); ok {
-			if err := c.Conn.Close(); err != nil {
-				s.logf("connection close error: %v", err)
+			if closeErr := c.Conn.Close(); closeErr != nil {
+				s.logf("connection close error: %v", closeErr)
 			}
 		}
-
 		return true
 	})
 
 	done := make(chan struct{})
 	go func() {
 		s.connWG.Wait()
-
 		close(done)
 	}()
 
@@ -93,7 +91,7 @@ func (s *Server) Stop() error {
 		<-done
 	}
 
-	return nil
+	return err
 }
 
 func (s *Server) acceptLoop() {
@@ -109,22 +107,22 @@ func (s *Server) acceptLoop() {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				time.Sleep(100 * time.Millisecond)
-
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				time.Sleep(5 * time.Millisecond)
 				continue
 			}
-			s.logf("accept error: %v", err)
-
-			return
+			select {
+			case <-s.stopChan:
+				return
+			default:
+				s.logf("accept error: %v", err)
+				return
+			}
 		}
 
 		if s.config.MaxConns > 0 {
 			if int(s.activeConnCount.Load()) >= s.config.MaxConns {
-				if err := conn.Close(); err != nil {
-					s.logf("connection close error: %v", err)
-				}
-
+				_ = conn.Close()
 				continue
 			}
 		}
@@ -152,33 +150,23 @@ func (s *Server) removeConnection(sc *ServerConn) {
 func (s *Server) connectionLoop(sc *ServerConn) {
 	defer func() {
 		s.removeConnection(sc)
-
-		if err := sc.Conn.Close(); err != nil {
-			s.logf("connection close error: %v", err)
-		}
-
+		_ = sc.Conn.Close()
 		s.connWG.Done()
 	}()
 
 	for {
 		if s.config.IdleTimeout > 0 {
-			if err := sc.Conn.SetReadDeadline(time.Now().Add(s.config.IdleTimeout)); err != nil {
-				s.logf("set read deadline error: %v", err)
-			}
+			_ = sc.Conn.SetReadDeadline(time.Now().Add(s.config.IdleTimeout))
 		}
 
 		msg, err := anet.ReadPooled(sc.Conn)
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				s.logf("closing idle connection: %v", sc.Conn.RemoteAddr())
-			}
-
 			return
 		}
 
 		if len(msg) < 4 {
 			s.logf("protocol error: message too short")
-			anet.PutBuffer(msg) // Return buffer if invalid
+			anet.PutBuffer(msg)
 			return
 		}
 
@@ -190,9 +178,7 @@ func (s *Server) connectionLoop(sc *ServerConn) {
 }
 
 func (s *Server) dispatchMessage(sc *ServerConn, taskID, request, originalBuf []byte) {
-	// Acquire semaphore if configured
 	if s.handlerSem != nil {
-		// Blocking here provides backpressure to the connection reader loop.
 		s.handlerSem <- struct{}{}
 	}
 
@@ -213,50 +199,56 @@ func (s *Server) dispatchMessage(sc *ServerConn, taskID, request, originalBuf []
 			return
 		}
 
-		// reuse buffer for taskID+resp to reduce allocations.
-		required := anet.LENGTHSIZE + len(taskID) + len(resp)
-		buf := anet.GetBuffer(required)
+		payloadLen := len(taskID) + len(resp)
+		totalLen := anet.LENGTHSIZE + payloadLen
 
-		// Ensure buffer has enough capacity (GetBuffer guarantees at least required size)
-		// But GetBuffer returns a slice with len=required if it allocated new,
-		// or len=poolSize if from pool.
-		// We need to reslice to required length.
-		if cap(buf) < required {
-			// Should not happen if GetBuffer works as documented
-			buf = make([]byte, required)
+		if totalLen <= 512 {
+			var stackBuf [512 + anet.LENGTHSIZE]byte
+			switch anet.LENGTHSIZE {
+			case 2:
+				binary.BigEndian.PutUint16(stackBuf[0:2], uint16(payloadLen))
+			case 4:
+				binary.BigEndian.PutUint32(stackBuf[0:4], uint32(payloadLen))
+			}
+			copy(stackBuf[anet.LENGTHSIZE:anet.LENGTHSIZE+4], taskID)
+			copy(stackBuf[anet.LENGTHSIZE+4:], resp)
+
+			sc.writeMu.Lock()
+			if s.config.WriteTimeout > 0 {
+				_ = sc.Conn.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout))
+			}
+			_, writeErr := sc.Conn.Write(stackBuf[:totalLen])
+			sc.writeMu.Unlock()
+
+			if writeErr != nil {
+				s.logf("write error: %v", writeErr)
+				_ = sc.Conn.Close()
+			}
+			return
 		}
-		buf = buf[:required]
 
-		// Write header directly to avoid net.Buffers allocation in Write
+		buf := anet.GetBuffer(totalLen)
 		switch anet.LENGTHSIZE {
 		case 2:
-			binary.BigEndian.PutUint16(buf[0:2], uint16(len(taskID)+len(resp)))
+			binary.BigEndian.PutUint16(buf[0:2], uint16(payloadLen))
 		case 4:
-			binary.BigEndian.PutUint32(buf[0:4], uint32(len(taskID)+len(resp)))
+			binary.BigEndian.PutUint32(buf[0:4], uint32(payloadLen))
 		}
-
 		copy(buf[anet.LENGTHSIZE:anet.LENGTHSIZE+4], taskID)
 		copy(buf[anet.LENGTHSIZE+4:], resp)
 
 		sc.writeMu.Lock()
 		if s.config.WriteTimeout > 0 {
-			if err := sc.Conn.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout)); err != nil {
-				s.logf("set write deadline error: %v", err)
-			}
+			_ = sc.Conn.SetWriteDeadline(time.Now().Add(s.config.WriteTimeout))
 		}
-
 		_, writeErr := sc.Conn.Write(buf)
 		sc.writeMu.Unlock()
 
-		// return buffer to pool.
 		anet.PutBuffer(buf)
 
 		if writeErr != nil {
 			s.logf("write error: %v", writeErr)
-
-			if err := sc.Conn.Close(); err != nil {
-				s.logf("connection close error: %v", err)
-			}
+			_ = sc.Conn.Close()
 		}
 	}()
 }
