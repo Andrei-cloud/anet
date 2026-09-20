@@ -33,9 +33,14 @@ type RingBuffer[T any] struct {
 }
 
 // nextPow2Uint64 returns the smallest power of two >= v with a minimum of 1.
+// Values above 2^63 clamp to 2^63 (the bit-saturate trick overflows to 0 for
+// v == 2^64-1, which would silently build a reject-everything zero-capacity ring).
 func nextPow2Uint64(v uint64) uint64 {
-	if v == 0 {
+	if v <= 1 {
 		return 1
+	}
+	if v > 1<<63 {
+		return 1 << 63
 	}
 	v--
 	v |= v >> 1
@@ -109,23 +114,11 @@ func Write(w io.Writer, in []byte) error {
 
 	totalLen := LENGTHSIZE + payloadLen
 
-	// Fast path for small messages: format on stack without any heap/pool allocations.
-	if payloadLen <= 512 {
-		var stackBuf [512 + LENGTHSIZE]byte
-		switch LENGTHSIZE {
-		case 2:
-			binary.BigEndian.PutUint16(stackBuf[0:2], uint16(payloadLen))
-		case 4:
-			binary.BigEndian.PutUint32(stackBuf[0:4], uint32(payloadLen))
-		default:
-			return fmt.Errorf("unsupported header size: %d", LENGTHSIZE)
-		}
-		copy(stackBuf[LENGTHSIZE:], in)
-		_, err := w.Write(stackBuf[:totalLen])
-		return err
-	}
-
-	// For larger messages, use the pooled buffer to avoid heap allocations.
+	// The frame is staged in a buffer-pool buffer: the previous "stack
+	// buffer for small messages" fast path escaped through the io.Writer
+	// interface call (go build -gcflags=-m: "escapes to heap"), costing a
+	// measured 576 B/op heap allocation on the small-message benchmark.
+	// Buffer-pool round-trip measured ~11 ns/op with zero allocations.
 	buf := GetBuffer(totalLen)
 	switch LENGTHSIZE {
 	case 2:

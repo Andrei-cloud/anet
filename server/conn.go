@@ -2,14 +2,20 @@ package server
 
 import (
 	"net"
-	"sync"
+
+	"github.com/andrei-cloud/anet"
 )
 
 // ServerConn represents a client connection on the server side.
 type ServerConn struct {
-	Conn    net.Conn   // underlying network connection.
-	server  *Server    // reference to parent server.
-	writeMu sync.Mutex // serializes concurrent writes.
+	Conn    net.Conn        // underlying network connection.
+	server  *Server         // reference to parent server.
+	writeCh chan *respFrame // responses queued for the single writer goroutine.
+	done    chan struct{}   // closed once when the writer goroutine exits.
+	// hdr is the read-header scratch. As a field of the heap-allocated
+	// ServerConn it never escapes through io.ReadFull, replacing the old
+	// per-message escaping stack array (~8 B/op measured).
+	hdr [anet.LENGTHSIZE]byte
 }
 
 // init configures TCP keepalive and NoDelay settings on the connection.

@@ -173,6 +173,7 @@ func TestConnectionValidation(t *testing.T) {
 
 			p := &pool{
 				config: config,
+				logger: &NoopLogger{},
 			}
 
 			item := tt.setup()
@@ -189,7 +190,7 @@ func TestValidationStrategies(t *testing.T) {
 		config := DefaultPoolConfig()
 		config.ValidationStrategy = ValidationPing
 
-		p := &pool{config: config}
+		p := &pool{config: config, logger: &NoopLogger{}}
 
 		// Use basic item that doesn't implement net.Conn
 		item := &mockBasicItem{valid: true}
@@ -203,7 +204,7 @@ func TestValidationStrategies(t *testing.T) {
 		config.ValidationStrategy = ValidationRead
 		config.MaxValidationAttempts = 3
 
-		p := &pool{config: config}
+		p := &pool{config: config, logger: &NoopLogger{}}
 
 		// Test that validation respects MaxValidationAttempts
 		// Use a connection that always fails to verify retry count
@@ -326,7 +327,7 @@ func BenchmarkConnectionValidation(b *testing.B) {
 	config.ValidationStrategy = ValidationRead
 	config.ValidationTimeout = 10 * time.Millisecond
 
-	p := &pool{config: config}
+	p := &pool{config: config, logger: &NoopLogger{}}
 
 	benchmarks := []struct {
 		name     string
@@ -359,7 +360,7 @@ func TestValidationTimeout(t *testing.T) {
 	config.ValidationStrategy = ValidationRead
 	config.ValidationTimeout = 10 * time.Millisecond // Very short timeout
 
-	p := &pool{config: config}
+	p := &pool{config: config, logger: &NoopLogger{}}
 
 	// Create connection that will cause timeout
 	conn := newMockValidationConn()

@@ -70,15 +70,10 @@ func (bp *bufferPool) getBuffer(size int) []byte {
 
 	var classIdx int
 	if size > (1 << minClassShift) {
+		// size in (32, 65536] => bits.Len32(size-1) in [6, 16] => classIdx in [1, 11].
 		classIdx = bits.Len32(uint32(size-1)) - minClassShift
 	} else {
 		classIdx = 0
-	}
-
-	if classIdx < 0 {
-		classIdx = 0
-	} else if classIdx >= numClasses {
-		classIdx = numClasses - 1
 	}
 
 	poolSize := 1 << (classIdx + minClassShift)
@@ -104,15 +99,16 @@ func (bp *bufferPool) putBuffer(buf []byte) {
 	}
 
 	classIdx := bits.Len32(uint32(c)) - 1 - minClassShift
+	// c in [32, 65536] => bits.Len32(c) in [6, 17] => classIdx in [0, 11],
+	// so the range guard below is unreachable; it stays as cheap insurance
+	// because putBuffer is exported through PutBuffer to user buffers.
 	if classIdx < 0 || classIdx >= numClasses {
 		return
 	}
 
+	// poolSize = 2^floor(log2(c)) <= c for every c in [32, 65536], so a
+	// c < poolSize check would be unreachable.
 	poolSize := 1 << (classIdx + minClassShift)
-	if c < poolSize {
-		return
-	}
-
 	buf = buf[:poolSize]
 	ptr := ptrPool.Get().(*[]byte)
 	*ptr = buf

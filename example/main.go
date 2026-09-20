@@ -3,10 +3,8 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"sync"
 	"time"
@@ -45,21 +43,14 @@ func (lw *loggerWrapper) Errorf(format string, v ...any) {
 	lw.Printf("[ERROR] "+format, v...)
 }
 
-// tcpConnectionFactory creates new TCP connections for the connection pool.
-// It implements proper timeouts and TCP keepalive settings.
-func tcpConnectionFactory(addr string) (anet.PoolItem, error) {
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("failed to dial %s: %w", addr, err)
-	}
-
-	poolItem, ok := conn.(anet.PoolItem)
-	if !ok {
-		return nil, errors.New("failed to assert net.Conn as anet.PoolItem")
-	}
-
-	return poolItem, nil
-}
+// poolFactory dials TCP connections with the config's DialTimeout plus TCP
+// keepalive and TCP_NODELAY wired from the same PoolConfig, via the library
+// helper (previously this example hand-rolled a dialer and the config's
+// keepalive settings were dead fields).
+var poolFactory = anet.NewTCPFactory(&anet.PoolConfig{
+	DialTimeout:       5 * time.Second,
+	KeepAliveInterval: 30 * time.Second,
+})
 
 // startServer initializes and starts the anet TCP server.
 func startServer(addr string) (*server.Server, error) {
@@ -87,7 +78,7 @@ func startServer(addr string) (*server.Server, error) {
 // newBroker configures and starts an anet broker for the given server address.
 func newBroker(addr string) anet.Broker {
 	poolCap := uint32(5)
-	pools := anet.NewPoolList(poolCap, tcpConnectionFactory, []string{addr}, nil)
+	pools := anet.NewPoolList(poolCap, poolFactory, []string{addr}, nil)
 	numWorkers := 3
 	logger := &loggerWrapper{
 		Logger: log.New(os.Stdout, "BROKER: ", log.LstdFlags|log.Lmicroseconds),
@@ -142,6 +133,37 @@ func sendRequests(broker anet.Broker, requests []string) {
 	log.Println("client finished processing all responses.")
 }
 
+// sendAsyncRequests shows the asynchronous API: all requests are in flight
+// without parking a goroutine per response wait; the caller collects the
+// Responses in completion order.
+func sendAsyncRequests(broker anet.Broker, requests []string) error {
+	type pending struct {
+		label string
+		ch    <-chan anet.Response
+	}
+
+	var outstanding []pending
+	for _, reqStr := range requests {
+		reqData := []byte(reqStr)
+		ch, err := broker.SendAsync(&reqData)
+		if err != nil {
+			return fmt.Errorf("send %s: %w", reqStr, err)
+		}
+		outstanding = append(outstanding, pending{label: reqStr, ch: ch})
+	}
+	log.Printf("client has %d requests in flight", len(outstanding))
+
+	for _, p := range outstanding {
+		r := <-p.ch
+		if r.Err != nil {
+			log.Printf("client error for '%s': %v", p.label, r.Err)
+			continue
+		}
+		log.Printf("client received response for '%s': %s", p.label, string(r.Payload))
+	}
+	return nil
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
@@ -163,6 +185,10 @@ func main() {
 	defer broker.Close()
 
 	sendRequests(broker, []string{"hello", "world", "anet test", "concurrent", "request"})
+
+	if err := sendAsyncRequests(broker, []string{"async one", "async two"}); err != nil {
+		fmt.Fprintf(os.Stderr, "async sends failed: %v\n", err)
+	}
 
 	time.Sleep(200 * time.Millisecond)
 }
