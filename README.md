@@ -6,6 +6,9 @@
 
 `anet` is a high-throughput, low-latency Go networking module for asynchronous RPC over TCP: connection pooling with health management, a request/response broker with task-ID correlation, an opt-in multiplexed transport that puts thousands of outstanding requests on a handful of connections, and an embeddable TCP server.
 
+**Documentation:** [architecture](docs/ARCHITECTURE.md) ·
+[changelog](CHANGELOG.md) · [pkg.go.dev](https://pkg.go.dev/github.com/andrei-cloud/anet)
+
 ---
 
 ## Key Highlights
