@@ -736,11 +736,18 @@ The CI gate is `go test -race ./...` plus the benchmark matrix tracked with
 `benchstat` (count at least 3 samples, one variable at a time, reports kept
 as an audit trail). Transport capability is tracked by
 `BenchmarkTransport_RoundTrip` (sync vs async vs multiplex at 2/8/32
-connections) and burst behavior by `BenchmarkSendAsync_FireHundred`, which
-reports `sheds/op`: the synchronous queue sheds 36–103 submissions per burst
-at capacity where multiplex sheds 0.13–0.58.
+connections), which reports aggregate throughput via the `Mmsg/s` metric:
+multiplex on 2 connections measures 0.238 Mmsg/s versus 0.117 Mmsg/s for the
+synchronous queue on 100 connections with 18 concurrent caller threads
+(loopback TCP). Burst behavior is tracked by
+`BenchmarkSendAsync_FireHundred`, which reports `sheds/op`: the synchronous
+queue sheds 36–103 submissions per burst at capacity where multiplex sheds
+0.13–0.58. The server side is tracked by `BenchmarkServer_Echo_Parallel`
+(0.106 Mmsg/s aggregate across 18 client connections).
 
 ---
 
-*Document revision: the async build (`perf/async-networking` branch, commit
-`3a834b5`). Benchmarks measured on Apple M5 Max, darwin/arm64, Go 1.27.1.*
+*Document revision: v1.0.0. Benchmarks measured on Apple M5 Max,
+darwin/arm64, Go 1.27.1, `count=3`; aggregate throughput is the `Mmsg/s`
+metric reported by `BenchmarkTransport_RoundTrip`,
+`BenchmarkSendAsync_FireHundred`, and `BenchmarkServer_Echo_Parallel`.*

@@ -13,7 +13,8 @@
 
 ## Key Highlights
 
-- ⚡ **Low Latency & High Throughput**: Single-digit-microsecond request/response round-trips over TCP; Multiplex mode measured **1.6x faster** than the queue-worker transport using 50x fewer connections.
+- ⚡ **Throughput people compare on**: ~0.24 M messages/sec aggregate end-to-end request/response with **2 connections** on 18 concurrent callers — versus ~0.12 M/s from the same library using 100 connections and 100 queue workers. Multiplex mode doubles throughput with 50x fewer connections.
+- 🔬 **Microsecond latency**: single-digit-microsecond per-message round-trip (4.2 µs multiplex / 8.5 µs queue-mode on loopback); the server sustains ~0.11 M msg/s with 18 clients.
 - 🚀 **Allocation-Minded Hot Paths**: Framing `Write` is `0 B/op, 0 allocs/op`; server responses are `3 allocs/op` (was 6); buffer pool round-trip `~12 ns/op`.
 - 🔒 **Race-Tested Lifecycle**: Pool, broker, and server shutdowns are admission-safe: every connection is closed exactly once, `Close`/`Stop` are bounded by their timeouts, and cancel-while-queued cannot recycle live tasks.
 - 🛡️ **Production Network Hygiene**: `TCP_NODELAY` + keepalive via `anet.NewTCPFactory`, idle-connection eviction (actually enforced now), background validation, load shedding past outstanding-request bounds, and handler panic isolation.
@@ -188,13 +189,27 @@ broker := anet.NewBroker(pools, 0 /* Multiplex mode needs no workers */, nil, cf
 // up to 2 x 512 requests are in flight per pair of connections at once.
 ```
 
-Measured (`BenchmarkTransport_RoundTrip`, 100 concurrent goroutines, Apple M5 Max):
+Measured with `BenchmarkTransport_RoundTrip` (18 concurrent caller threads,
+12-byte payload, loopback TCP, Apple M5 Max, Go 1.27.1, `count=3`). `Mmsg/s`
+is aggregate end-to-end messages per second across all caller threads:
 
-| Transport | ns/op | Conns + workers |
-| :-- | --: | :-- |
-| Sync queue | 9,263 | 100 conns, 100 workers |
-| Async submit + await | 9,546 | 100 conns, 100 workers |
-| **Multiplex** | **5,891** | **2 conns, 0 workers** |
+| Transport | ns/op | Aggregate throughput | Connections + workers |
+| :-- | --: | --: | :-- |
+| Sync queue | 8,526 | 0.117 Mmsg/s | 100 conns, 100 workers |
+| Async submit + await | 8,605 | 0.116 Mmsg/s | 100 conns, 100 workers |
+| **Multiplex** | **4,199** | **0.238 Mmsg/s** | **2 conns, 0 workers** |
+| Multiplex | 7,192 | 0.139 Mmsg/s | 8 conns, 0 workers |
+| Multiplex | 9,013 | 0.111 Mmsg/s | 32 conns, 0 workers |
+
+Two readings matter. **Latency-bound traffic** (few outstanding requests per
+caller): multiplex on 2 connections doubles throughput because it removes
+the queue-worker handoff from the critical path. **Burst traffic**: with 100
+in-flight submissions per caller (`BenchmarkSendAsync_FireHundred`), the
+synchronous queue sheds 36–103 submissions per burst at saturation, while
+multiplex sheds under 1 — connections keep accepting work while their
+responses are outstanding. On a real network (not loopback) add connections
+toward `inflight x RTT/BDP` per direction; the shed margin, not the loopback
+latency, is what the bound buys you.
 
 ---
 
@@ -292,8 +307,8 @@ go test -run=^$ -bench=. -benchmem ./...
 | `Pool_GetPut` (idle reuse) | 17.6 ns/op | 47.2 ns/op\* | 0 B/op | 0 |
 | `Broker_Pipe_Parallel` | 2.94 µs/op | 3.41 µs/op\*\* | 301 → 435 B/op\*\* | 7 → 7 |
 | `BrokerSend/Workers_100` | 6.99 µs/op | **6.60 µs/op** | 703 → **259 B/op** | 7 → **6** |
-| `Server_Echo_Parallel` | 9.56 µs/op | 9.21 µs/op | 1,283 → **75 B/op** | 6 → **3** |
-| `Transport_RoundTrip/Multiplex_2conn` | — (new) | **5.89 µs/op** | 178 B/op | 4 |
+| `Server_Echo_Parallel` | 9.56 µs/op | 9.40 µs/op (**0.106 Mmsg/s** across 18 clients) | 1,283 → **75 B/op** | 6 → **3** |
+| `Transport_RoundTrip/Multiplex_2conn` | — (new) | **4.20 µs/op (0.238 Mmsg/s aggregate)** | 180 B/op | 4 |
 
 \* The pool now stamps idle time on Put and enforces `IdleTimeout`; the eviction plumbing costs one clock read per Put. On the µs-scale RPC path this is below measurement noise.
 \*\* The broker's result delivery is a fresh `chan Response` per request (~96 B): a pooled channel could swallow a live waiter's response (drain-vs-parked-select race, reproduced); correctness bought one small allocation. On the real TCP transport (`BrokerSend`) bytes per request still fell ~63% and latency improved; the in-memory `net.Pipe` bench, which is dominated by allocation rather than I/O, shows the channel cost.

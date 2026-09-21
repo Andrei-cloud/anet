@@ -4,11 +4,13 @@ All notable changes to `github.com/andrei-cloud/anet` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/); this
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## [1.0.0] - 2026-09-21
 
-The asynchronous build. Landmarks: the `SendAsync` API, a multiplexed
-per-connection transport, a rewritten task-ownership model, bounded
-shutdowns, and measured allocation reductions across every hot path.
+The asynchronous build, released as v1.0.0. Landmarks: the `SendAsync` API,
+a multiplexed per-connection transport, a rewritten task-ownership model,
+bounded shutdowns, and measured allocation reductions across every hot
+path. Reaching 1.0.0 freezes the exported API under Semantic Versioning:
+additive changes bump minor, breaking changes major.
 Introduced on branch `perf/async-networking` (commit `3a834b5`) on top of
 `v0.3.0`. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design.
 
@@ -156,12 +158,16 @@ via `benchstat`. Full methodology and per-allocation accounting:
 | `Pool/GetPut` | 17.6 ns | 47.2 ns\*\* | 0 B | 0 |
 | `BufferPool/GetPut` | 11.5 ns | 12.0 ns | 0 B | 0 |
 
-New transport comparison (`BenchmarkTransport_RoundTrip`, 100 concurrent
-callers): synchronous queue on 100 connections with 100 workers takes
-9.26 µs/round-trip; **Multiplex on 2 connections with zero workers takes
-5.89 µs**. Burst submission (`BenchmarkSendAsync_FireHundred`, 100 requests
-per iteration): the synchronous queue sheds 36–103 submissions per iteration
-at saturation; Multiplex sheds 0.13–0.58.
+New transport comparison (`BenchmarkTransport_RoundTrip`; 18 concurrent
+caller threads, loopback TCP; `Mmsg/s` is aggregate end-to-end messages per
+second across all threads): the synchronous queue on 100 connections with
+100 workers runs 8.53 µs/round-trip (**0.117 Mmsg/s**); **Multiplex on 2
+connections with zero workers runs 4.20 µs (0.238 Mmsg/s)** — double the
+throughput on 50x fewer connections. Burst submission
+(`BenchmarkSendAsync_FireHundred`, 100 requests per iteration): the
+synchronous queue sheds 36–103 submissions per iteration at saturation;
+Multiplex sheds 0.13–0.58. Server side (`BenchmarkServer_Echo_Parallel`):
+0.106 Mmsg/s aggregate across 18 client connections at 9.4 µs/op.
 
 \* The sequential echo path pays one channel handoff to the batching writer
 goroutine; the parallel throughput and 94% of the allocations improved.

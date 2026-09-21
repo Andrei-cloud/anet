@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/andrei-cloud/anet"
 )
@@ -41,16 +42,30 @@ func newAsyncBenchBroker(b *testing.B, nconns, workers int, multiplex bool) anet
 	return broker
 }
 
+// reportThroughput reports aggregate end-to-end message throughput in
+// millions of messages per second over the wall time the benchmark ran.
+// For b.RunParallel benchmarks this is the combined rate of all parallel
+// threads: the number a caller can plan capacity around.
+func reportThroughput(b *testing.B, t0 time.Time) {
+	elapsed := time.Since(t0)
+	if elapsed > 0 {
+		b.ReportMetric(float64(b.N)/elapsed.Seconds()/1e6, "Mmsg/s")
+	}
+}
+
 // BenchmarkTransport_RoundTrip measures full request/response throughput
 // (send + await echo) per transport shape: synchronous queue workers vs the
 // async API on queue workers vs Multiplex pipelining with the same or fewer
-// connections. Same 12-byte payload everywhere.
+// connections. Same 12-byte payload everywhere. The Mmsg/s column is the
+// aggregate message rate across all benchmark threads.
 func BenchmarkTransport_RoundTrip(b *testing.B) {
 	payload := []byte("roundtrip-pr")
 
 	b.Run("Sync", func(b *testing.B) {
 		broker := newAsyncBenchBroker(b, 100, 100, false)
 		b.ReportAllocs()
+		b.ResetTimer()
+		t0 := time.Now()
 		b.RunParallel(func(pb *testing.PB) {
 			req := payload
 			for pb.Next() {
@@ -59,11 +74,14 @@ func BenchmarkTransport_RoundTrip(b *testing.B) {
 				}
 			}
 		})
+		reportThroughput(b, t0)
 	})
 
 	b.Run("AsyncAwait", func(b *testing.B) {
 		broker := newAsyncBenchBroker(b, 100, 100, false)
 		b.ReportAllocs()
+		b.ResetTimer()
+		t0 := time.Now()
 		b.RunParallel(func(pb *testing.PB) {
 			req := payload
 			for pb.Next() {
@@ -76,12 +94,15 @@ func BenchmarkTransport_RoundTrip(b *testing.B) {
 				}
 			}
 		})
+		reportThroughput(b, t0)
 	})
 
 	for _, nconns := range []int{2, 8, 32} {
 		b.Run(fmt.Sprintf("Multiplex_%dconn", nconns), func(b *testing.B) {
 			broker := newAsyncBenchBroker(b, nconns, 0, true)
 			b.ReportAllocs()
+			b.ResetTimer()
+			t0 := time.Now()
 			b.RunParallel(func(pb *testing.PB) {
 				req := payload
 				for pb.Next() {
@@ -94,6 +115,7 @@ func BenchmarkTransport_RoundTrip(b *testing.B) {
 					}
 				}
 			})
+			reportThroughput(b, t0)
 		})
 	}
 }

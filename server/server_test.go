@@ -157,6 +157,7 @@ func BenchmarkServer_Echo_Parallel(b *testing.B) {
 
 	b.ReportAllocs()
 	b.ResetTimer()
+	t0 := time.Now()
 
 	b.RunParallel(func(pb *testing.PB) {
 		conn, err := net.Dial("tcp", addr)
@@ -186,4 +187,10 @@ func BenchmarkServer_Echo_Parallel(b *testing.B) {
 			}
 		}
 	})
+
+	// Aggregate server-side throughput: combined message rate of all
+	// benchmark threads (each with its own connection).
+	if elapsed := time.Since(t0); elapsed > 0 {
+		b.ReportMetric(float64(b.N)/elapsed.Seconds()/1e6, "Mmsg/s")
+	}
 }
